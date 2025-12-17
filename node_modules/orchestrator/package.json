@@ -1,0 +1,20 @@
+{
+  "name": "orchestrator",
+  "version": "1.0.0",
+  "description": "Service to coordinate data flow and AI agents.",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@read-ai/shared-config": "^1.0.0",
+    "axios": "^1.6.8",
+    "body-parser": "^1.20.2",
+    "express": "^4.18.3",
+    "mammoth": "^1.11.0",
+    "multer": "^2.0.2"
+  },
+  "keywords": [],
+  "author": ""
+}

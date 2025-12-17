@@ -1,0 +1,20 @@
+{
+  "name": "read-ai-task-automation",
+  "version": "1.0.0",
+  "description": "Read.ai Transcript Automation System",
+  "main": "index.js",
+  "license": "MIT",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "start:orchestrator": "npm run --workspace orchestrator start",
+    "start:mcp": "npm run --workspace mcp-server start",
+    "start:all": "concurrently \"npm run start:mcp\" \"npm run start:orchestrator\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
