@@ -108,15 +108,36 @@ app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res)
         // --- 2. NOTION CONTEXT QUERY (THIS IS NOW HANDLED BY MCP SERVER) ---
         
         // --- 3. TASK GENERATION/APPROVAL (MCP Server) ---
-        const generationResponse = await axios.post(`${MCP_SERVER_URL}/api/v1/generate-tasks`, {
-            normalized_data: normalizedData,
-            // Removed notion_context: The MCP Server fetches it internally now.
-        });
-        console.log('-> 3. Task generation initiated on MCP.');
+        // const generationResponse = await axios.post(`${MCP_SERVER_URL}/api/v1/generate-tasks`, {
+        //     normalized_data: normalizedData,
+        //     // Removed notion_context: The MCP Server fetches it internally now.
+        // });
+        // console.log('-> 3. Task generation initiated on MCP.');
+
+        const response = await axios.post(
+            `${MCP_SERVER_URL}/api/v1/process-transcript`, 
+            {
+                transcript: rawTranscript,
+                source,
+                source_id,
+                meeting_title,
+                participants,
+                raw_transcript: rawTranscript
+            },
+            {
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                timeout: 300000
+            }
+        );
+
+        const finalTasks = response.data;
 
         res.status(202).send({ 
             message: 'Transcript accepted and processing pipeline initiated.',
-            transcript_id: normalizedData.transcript_id
+            transcript_id: normalizedData.transcript_id,
+            results: finalTasks.requests || [],
         });
 
     } catch (error) {

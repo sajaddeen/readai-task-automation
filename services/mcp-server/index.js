@@ -6,6 +6,8 @@ const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
+const { simplifyAnyPage } = require('../utilities/notionHelper');
+const { findBestDatabaseMatch } = require('../utilities/dbFinder');
 
 // IMPORTANT: We rely on the global mongoose instance exported from shared-config
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
@@ -223,7 +225,7 @@ const queryNotionDB = async (extractedProjects) => {
     console.log(`\n[Notion] Querying database for ${projectNames.length} project(s)...`);
     
     try {
-        const response = await notion.databases.query({
+        const response = await notion.dataSources.query({
             database_id: NOTION_TASK_DB_ID,
             filter: filter,
             properties: ['Title', 'Status', 'Project'], 
@@ -356,6 +358,97 @@ const sendToSlackForApproval = async (taskList, meetingTitle) => {
     console.log(`[Slack] Mock: Sent ${taskList.length} tasks for review to ${SLACK_CHANNEL}`);
 };
 
+// --- NOTION: LIST ALL DATABASES ---
+
+const listAllNotionDatabases = async () => {
+    try {
+        console.log("\n[Notion] Listing all databases via Search API...");
+
+        let allDBs = [];
+        let cursor = undefined;
+
+        do {
+            const response = await notion.search({
+                query: "", // empty to list everything
+                filter: {
+                    property: "object",
+                    value: "data_source"
+                },
+                start_cursor: cursor,
+                page_size: 100
+            });
+
+            if (response.results) {
+                response.results.forEach(item => {
+                    allDBs.push({
+                        id: item.id,
+                        title: item.title?.map(t => t.plain_text).join("") || "(No title)",
+                        object: item.object
+                    });
+                });
+            }
+
+            cursor = response.has_more ? response.next_cursor : undefined;
+        } while (cursor);
+
+        console.log(`[Notion] Found ${allDBs.length} databases:`, allDBs);
+        return allDBs;
+
+    } catch (error) {
+        console.error("[Notion] Failed to list databases:", error.message);
+        throw error;
+    }
+};
+
+const fetchAllRowsInDataSource = async (data_source_id) => {
+  const allPages = [];
+  let cursor;
+
+  do {
+    const response = await notion.dataSources.query({
+      data_source_id,
+      start_cursor: cursor,
+      page_size: 100
+    });
+
+    allPages.push(...response.results);
+    cursor = response.has_more ? response.next_cursor : undefined;
+  } while (cursor);
+
+  return allPages;
+};
+
+// Test route: fetch all pages in a Notion database by ID
+app.get('/api/v1/notion-data-source-rows', async (req, res) => {
+  try {
+    const { db_id } = req.query;
+    if (!db_id) {
+      return res.status(400).send({ message: "Missing query param: db_id" });
+    }
+
+    const pages = await fetchAllRowsInDataSource(db_id);
+
+    res.status(200).send({
+      count: pages.length,
+      pages: pages.map(simplifyAnyPage)
+    });
+  } catch (error) {
+    console.error("Error fetching rows:", error.message);
+    res.status(500).send({ error: error.message });
+  }
+});
+
+
+
+app.get('/api/v1/list-notion-databases', async (req, res) => {
+    try {
+        const databases = await listAllNotionDatabases();
+        res.status(200).send({ databases });
+    } catch (error) {
+        res.status(500).send({ error: error.message });
+    }
+});
+
 
 // --- MCP SERVER API ENDPOINTS ---
 
@@ -443,6 +536,165 @@ app.post('/api/v1/generate-tasks', async (req, res) => {
         res.status(500).send({ message: 'Failed to generate task list.', error: error.message });
     }
 });
+
+
+
+// full process
+
+// ----------------- PROCESS TRANSCRIPT ENDPOINT -----------------
+
+app.post('/api/v1/process-transcript', async (req, res) => {
+  try {
+    const { transcript, source, source_id, meeting_title, participants, raw_transcript } = req.body;
+
+    if (!transcript) {
+      return res.status(400).send({ error: "Transcript text is required." });
+    }
+
+    // --- 1) Normalize with GPT ---
+    const normalized = await normalizeTranscript(transcript, {
+      source,
+      source_id,
+      meeting_title,
+      participants
+    });
+
+    // Get project name out of normalized data
+    const projectBlock =
+      normalized.extracted_entities.projects &&
+      normalized.extracted_entities.projects[0];
+
+    const projectName =
+      projectBlock && projectBlock.project_name
+        ? projectBlock.project_name.trim()
+        : null;
+
+    if (!projectName) {
+      return res.status(400).send({ error: "No project name found in normalized data." });
+    }
+
+   // --- 2) Load all Notion databases ---
+const allSources = await listAllNotionDatabases();
+
+if (!allSources || allSources.length === 0) {
+  return res.status(500).send({ error: "No Notion databases found." });
+}
+
+// --- 3) Find best matching DB using GPT ---
+let chosenTitle = await findBestDatabaseMatch(projectName, allSources);
+
+// Fallback: simple contains match
+if (!chosenTitle) {
+  chosenTitle = allSources.find(ds =>
+    ds.title.toLowerCase().includes(projectName.toLowerCase())
+  )?.title;
+}
+
+if (!chosenTitle) {
+  return res.status(404).send({ error: "No matching Notion DB found." });
+}
+
+const match = allSources.find(ds => ds.title === chosenTitle);
+
+console.log(
+  `[Notion] Best DB match for project "${projectName}": "${match.title}" (ID: ${match.id})`
+);
+
+    // --- 3) Get all rows from Notion ---
+    console.log(`[Notion] Fetching all rows from DB: ${match.id}`);
+    const allPages = await fetchAllRowsInDataSource(match.id);
+
+    const pages = allPages.map(simplifyAnyPage);
+    console.log(`  -> Retrieved ${pages.length} pages from Notion DB.`);
+
+    // Simplify each page (so we only use title, status, notes, url)
+    const existingTasks = pages.map(page => ({
+  id: page.id || "",
+  title: page.task || "",           // simplified helper gives `task`
+  status: page.status || "",
+  notes: page.notes || "",          // if you later add notes in simplifyAnyPage
+  url: `https://www.notion.so/${(page.id || "").replace(/-/g, "")}`
+}));
+
+    // --- 4) Build array of normalized proposals ---
+    const proposals = normalized.extracted_entities.projects.flatMap(p =>
+      p.tasks.map(t => ({
+        title: t.task_title,
+        project: p.project_name,
+        notes: t.notes,
+        status: t.status,
+      }))
+    );
+
+    // --- 5) Semantic compare with GPT for UPDATE vs CREATE ---
+    const finalOutput = [];
+
+    for (const proposal of proposals) {
+      try {
+        // Prompt tailored to your comparison rules
+        const comparePrompt = `
+You are the Prouvé Sync Manager.
+Compare the following task proposal:
+
+${JSON.stringify(proposal)}
+
+Against these existing Notion tasks:
+
+${JSON.stringify(existingTasks)}
+
+Return ONLY a JSON object with exactly this schema:
+{
+  "display_line": "string",
+  "action": "CREATE | UPDATE",
+  "notion_url": "string",
+  "title": "string",
+  "project": "string",
+  "notes": "string",
+  "status": "string"
+}
+Do not add any extra text or explanation.
+`;
+
+        // Call GPT for semantic comparison
+        const gptResponse = await fetch(
+          "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: "gpt-5.2",
+              messages: [
+                { role: "system", content: "You compare tasks." },
+                { role: "user", content: comparePrompt },
+              ],
+              temperature: 0.0,
+            }),
+          }
+        );
+
+        const jsonResp = await gptResponse.json();
+        const content = jsonResp.choices?.[0]?.message?.content;
+
+        // Parse must be JSON only, no markdown
+        const parsed = JSON.parse(content);
+
+        finalOutput.push(parsed);
+      } catch (err) {
+        console.error("Comparison error:", err);
+      }
+    }
+
+    // --- 6) Return results ---
+    return res.status(200).send(finalOutput);
+  } catch (error) {
+    console.error("PROCESS ERROR:", error.message);
+    return res.status(500).send({ error: error.message });
+  }
+});
+
 
 // Start the server
 const startServer = async () => {
