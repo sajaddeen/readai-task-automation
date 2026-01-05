@@ -151,7 +151,7 @@ app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res)
 // Start the server
 const startServer = async () => {
     await connectDB();
-    app.listen(PORT, () => {
+    app.listen(PORT, "0.0.0.0", () => {
         console.log(`🚀 Orchestrator Service running on port ${PORT}`);
     });
 };
