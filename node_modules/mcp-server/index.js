@@ -24,6 +24,70 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true })); 
 
 
+// --- NEW: SLACK MESSAGING HELPER ---
+
+const sendTaskListToSlack = async (taskList, meetingTitle) => {
+    if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
+        console.warn("\n⚠️ SLACK CONFIG MISSING: Skipping Slack notification.");
+        return;
+    }
+
+    const createdCount = taskList.filter(t => t.action === 'CREATE').length;
+    const updatedCount = taskList.filter(t => t.action === 'UPDATE').length;
+
+    // Build blocks for a professional Slack message
+    const blocks = [
+        {
+            type: "header",
+            text: {
+                type: "plain_text",
+                text: `📝 Sync Report: ${meetingTitle}`,
+                emoji: true
+            }
+        },
+        {
+            type: "section",
+            text: {
+                type: "mrkdwn",
+                text: `*Status:* Identification Complete\n*Summary:* 🆕 ${createdCount} New Tasks | 🔄 ${updatedCount} Updates`
+            }
+        },
+        { type: "divider" }
+    ];
+
+    // Add individual task sections
+    taskList.forEach((task) => {
+        const icon = task.action === 'CREATE' ? '🟢' : '🔵';
+        let taskText = `${icon} *${task.title}*\n*Status:* ${task.status}\n*Notes:* ${task.notes}`;
+        
+        blocks.push({
+            type: "section",
+            text: { type: "mrkdwn", text: taskText }
+        });
+
+        if (task.notion_url && task.notion_url !== "New Task") {
+            blocks.push({
+                type: "context",
+                elements: [
+                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open in Notion>` }
+                ]
+            });
+        }
+    });
+
+    try {
+        await slackClient.chat.postMessage({
+            channel: SLACK_CHANNEL,
+            text: `Tasks identified for ${meetingTitle}`, // Fallback text
+            blocks: blocks
+        });
+        console.log(`✅ Task list successfully sent to Slack channel: ${SLACK_CHANNEL}`);
+    } catch (error) {
+        console.error("❌ Failed to send Slack message:", error.message);
+    }
+};
+
+
 // --- AI AGENT 1: TRANSCRIPT NORMALIZATION (LIVE) ---
 
 const normalizeTranscript = async (transcript, initialData) => {
@@ -260,11 +324,16 @@ const generateTaskList = async (normalizedData, notionContext) => {
     
     // 1. Flatten the hierarchical AI-extracted tasks into a single list
     const allAIExtractedTasks = normalizedData.extracted_entities.projects.flatMap(p => 
-        p.tasks.map(taskTitle => ({
-            title: taskTitle,
-            project: p.project_name,
-            transcript_id: normalizedData.transcript_id
-        }))
+      p.tasks.map(t => ({
+  title: t.task_title,
+  project: p.project_name,
+  notes: t.notes,
+  status: t.status,
+  owner: t.owner,
+  proposal_type: t.proposal_type,
+  transcript_id: normalizedData.transcript_id
+}))
+
     );
     
     const taskList = [];
@@ -303,7 +372,7 @@ const generateTaskList = async (normalizedData, notionContext) => {
                 description: `ACTION ITEM from meeting: ${normalizedData.meeting_title}.`,
                 action: 'CREATE',
                 status: 'To do', // Default status for new tasks
-                transcript_id: aiTask.transcript_id
+                transcript_id: normalizedData.transcript_id
             });
         }
     }
@@ -312,51 +381,6 @@ const generateTaskList = async (normalizedData, notionContext) => {
     return taskList;
 };
 
-
-// --- SLACK FUNCTIONS ---
-
-const formatTasksForSlack = (taskList, meetingTitle) => {
-    // ... (unchanged)
-    const newTasksCount = taskList.filter(t => t.action === 'CREATE').length;
-    const existingTasksCount = taskList.filter(t => t.action === 'UPDATE').length;
-    
-    // Summary text logic
-    const summaryText = taskList
-        .slice(0, 5)
-        .map(t => `• *${t.action}*: ${t.title} (${t.project || 'Unassigned'}) - Status: ${t.status || 'N/A'}`)
-        .join('\n');
-
-    return [
-        {
-            type: "header",
-            text: { type: "plain_text", text: `📝 Tasks Proposed from Meeting: ${meetingTitle}`, }
-        },
-        {
-            type: "section",
-            text: { type: "mrkdwn", text: `The AI agent identified *${newTasksCount} new task(s)* and *${existingTasksCount} existing task(s)* requiring review.`, }
-        },
-        {
-            type: "actions",
-            elements: [
-                {
-                    type: "button",
-                    text: { type: "plain_text", text: "Review Tasks", emoji: true },
-                    style: "primary",
-                    value: JSON.stringify({ action: "review_tasks", transcript_id: taskList[0]?.transcript_id || "unknown" }),
-                    action_id: "open_task_review_modal"
-                }
-            ]
-        }
-    ];
-};
-
-const sendToSlackForApproval = async (taskList, meetingTitle) => {
-    if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
-        console.warn("\n⚠️ SLACK KEYS MISSING: Skipping Slack message send.");
-        return;
-    }
-    console.log(`[Slack] Mock: Sent ${taskList.length} tasks for review to ${SLACK_CHANNEL}`);
-};
 
 // --- NOTION: LIST ALL DATABASES ---
 
@@ -527,7 +551,7 @@ app.post('/api/v1/generate-tasks', async (req, res) => {
         // STEP 4: Generate/Compare Task List
         const taskList = await generateTaskList(normalized_data, actualNotionContext);
 
-        await sendToSlackForApproval(taskList, normalized_data.meeting_title); 
+        // await sendToSlackForApproval(taskList, normalized_data.meeting_title); 
 
         res.status(200).send({ message: 'Task list generated and sent to Slack for approval.' });
 
@@ -632,17 +656,39 @@ console.log(
     for (const proposal of proposals) {
       try {
         // Prompt tailored to your comparison rules
-        const comparePrompt = `
+       const comparePrompt = `
 You are the Prouvé Sync Manager.
-Compare the following task proposal:
 
+Decide whether the task proposal should be CREATED or UPDATED.
+
+MATCHING RULES:
+- UPDATE only if the proposal clearly refers to the SAME OUTCOME
+- Match by meaning, not wording
+- If multiple matches exist, choose the BEST ONE
+
+STRICT OUTPUT RULES:
+- If UPDATE:
+  - notion_url MUST be copied EXACTLY from the matched existing task
+  - status MUST come from the matched existing task
+- If CREATE:
+  - notion_url MUST be exactly "New Task"
+  - status MUST come from proposal.status
+
+DISPLAY LINE RULE:
+- "✓ Task CREATED: <title>"
+- "✓ Task UPDATED: <title>"
+
+TASK PROPOSAL:
 ${JSON.stringify(proposal)}
 
-Against these existing Notion tasks:
-
+EXISTING NOTION TASKS:
 ${JSON.stringify(existingTasks)}
 
-Return ONLY a JSON object with exactly this schema:
+RETURN ONLY VALID JSON
+NO commentary
+NO markdown
+
+OUTPUT SCHEMA:
 {
   "display_line": "string",
   "action": "CREATE | UPDATE",
@@ -652,42 +698,54 @@ Return ONLY a JSON object with exactly this schema:
   "notes": "string",
   "status": "string"
 }
-Do not add any extra text or explanation.
 `;
 
+
+
         // Call GPT for semantic comparison
-        const gptResponse = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: "gpt-5.2",
-              messages: [
-                { role: "system", content: "You compare tasks." },
-                { role: "user", content: comparePrompt },
-              ],
-              temperature: 0.0,
-            }),
-          }
-        );
+const gptResponse = await fetch(
+  "https://api.openai.com/v1/chat/completions",
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-5.2",
+      messages: [
+        { role: "system", content: "You compare tasks and return strict JSON only." },
+        { role: "user", content: comparePrompt }
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" } 
+    }),
+  }
+);
 
-        const jsonResp = await gptResponse.json();
-        const content = jsonResp.choices?.[0]?.message?.content;
 
-        // Parse must be JSON only, no markdown
-        const parsed = JSON.parse(content);
+const jsonResp = await gptResponse.json();
 
-        finalOutput.push(parsed);
+const content = jsonResp.choices?.[0]?.message?.content;
+console.log("🧠 GPT RAW OUTPUT:", content);
+
+const parsed = JSON.parse(content);
+
+if (parsed.action === "UPDATE" && parsed.notion_url === "New Task") {
+  throw new Error("UPDATE action returned without Notion URL");
+}
+
+
+finalOutput.push(parsed);
       } catch (err) {
         console.error("Comparison error:", err);
       }
     }
 
-    // --- 6) Return results ---
+    // --- 6) SEND TO SLACK ---
+    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting");
+
+    // --- 7) Return results ---
     return res.status(200).send(finalOutput);
   } catch (error) {
     console.error("PROCESS ERROR:", error.message);
