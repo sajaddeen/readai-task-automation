@@ -860,6 +860,9 @@ OUTPUT SCHEMA:
   "action": "CREATE | UPDATE",
   "notion_url": "string",
   "title": "string",
+  "owner": "string",
+  "priority": "string",
+  "linked_jtbd": "string",
   "project": "string",
   "notes": "string",
   "status": "string"
