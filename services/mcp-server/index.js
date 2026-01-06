@@ -530,7 +530,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     parent: { database_id: dbId },
                     properties: {
                         "Title": { title: [{ text: { content: taskData.title } }] },
-                        "Status": { select: { name: taskData.status || "To Do" } },
+                        "Status": { status: { name: taskData.status || "To Do" } },
                         "Project": { rich_text: [{ text: { content: taskData.project || "General" } }] },
                         "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] }
                     }
@@ -564,7 +564,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                         page_id: pageId,
                         properties: {
                              // Example: Update status to 'In Progress' or keep existing
-                            "Status": { select: { name: taskData.status } },
+                            "Status": { status: { name: taskData.status } },
                             // Append to notes (optional strategy)
                              "Notes": { rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] }
                         }
