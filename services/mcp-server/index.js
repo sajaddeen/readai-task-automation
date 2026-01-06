@@ -808,13 +808,17 @@ console.log(
 
     // --- 4) Build array of normalized proposals ---
     const proposals = normalized.extracted_entities.projects.flatMap(p =>
-      p.tasks.map(t => ({
-        title: t.task_title,
-        project: p.project_name,
-        notes: t.notes,
-        status: t.status,
-      }))
-    );
+  p.tasks.map(t => ({
+    title: t.task_title,
+    project: p.project_name,
+    notes: t.notes,
+    status: t.status,
+    owner: t.owner && t.owner !== "" ? t.owner : "Unassigned",
+    priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
+    linked_jtbd: t.linked_jtbd?.name || "TBD"
+  }))
+);
+
 
     // --- 5) Semantic compare with GPT for UPDATE vs CREATE ---
     const finalOutput = [];
@@ -831,6 +835,13 @@ MATCHING RULES:
 - UPDATE only if the proposal clearly refers to the SAME OUTCOME
 - Match by meaning, not wording
 - If multiple matches exist, choose the BEST ONE
+
+FIELD PRESERVATION RULE:
+- owner MUST be copied from proposal.owner
+- priority MUST be copied from proposal.priority
+- linked_jtbd MUST be copied from proposal.linked_jtbd
+- Do NOT invent or erase these fields
+
 
 STRICT OUTPUT RULES:
 - If UPDATE:
@@ -910,6 +921,7 @@ finalOutput.push(parsed);
         console.error("Comparison error:", err);
       }
     }
+
 
     // --- 6) SEND TO SLACK WITH BUTTONS AND TARGET DB ID ---
     // UPDATED CALL: We now pass the match.id (Target DB ID) to the Slack helper
