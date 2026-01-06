@@ -26,13 +26,13 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // --- NEW: SLACK MESSAGING HELPER WITH BUTTONS ---
 
+// --- UPDATED: SLACK MESSAGE WITH VERTICAL LIST FORMAT ---
 const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
         console.warn("\n⚠️ SLACK CONFIG MISSING: Skipping Slack notification.");
         return;
     }
 
-    // 1. Split the tasks into two groups
     const newTasks = taskList.filter(t => t.action === 'CREATE');
     const updateTasks = taskList.filter(t => t.action === 'UPDATE');
 
@@ -48,44 +48,52 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         }
     });
 
-    blocks.push({
-        type: "context",
-        elements: [
-            { type: "mrkdwn", text: `*Target Database:* ${targetDbId ? 'Dynamic Match' : 'Default'}` }
-        ]
-    });
-
     blocks.push({ type: "divider" });
 
-    // --- HELPER TO GENERATE TASK BLOCKS ---
+    // --- HELPER: GENERATE VERTICAL LIST BLOCKS ---
     const generateTaskBlocks = (task) => {
         const taskBlocks = [];
         
-        // Prepare the payload for the button (Embed Task Data + Target DB ID)
-        // We limit payload size by truncating notes if necessary to avoid Slack 2000 char limit errors
+        // Prepare Button Payload
         const buttonPayload = JSON.stringify({
             ...task,
             targetDbId: targetDbId || NOTION_TASK_DB_ID,
             notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
         });
 
-        // 1. Task Details
-        const icon = task.action === 'CREATE' ? '✨' : '🔄';
+        const typeLabel = task.action === 'CREATE' ? "Create new Task" : "Update existing Task";
+
+        // --- THE FORMATTING MAGIC IS HERE ---
+        // We use \n for new lines. We add \n\n before Notes to give it breathing room.
+        const detailsText = 
+`*Proposal type:* ${typeLabel}
+*Task title:* ${task.title}
+*Linked JTBD:* ${task.linked_jtbd || "TBD"}
+*Owner:* ${task.owner}
+*Status:* ${task.status}
+*Priority Level:* ${task.priority || "Medium"}
+*Source:* Virtual Meeting
+
+*Notes:* ${task.notes}`;
+
+        // 1. Add the text block
         taskBlocks.push({
             type: "section",
             text: {
                 type: "mrkdwn",
-                text: `${icon} *${task.title}*\n*Reasoning:* ${task.notes}\n*Status:* \`${task.status}\``
+                text: detailsText
             }
         });
 
-        // 2. Action Buttons (Accept / Skip)
+        // 2. Action Buttons
+        const btnText = task.action === 'CREATE' ? "✅ Accept & Create" : "✅ Accept & Update";
+        
         taskBlocks.push({
             type: "actions",
             elements: [
                 {
                     type: "button",
-                    text: { type: "plain_text", text: task.action === 'CREATE' ? "✅ Accept & Create" : "✅ Accept & Update" },
+                    text: { type: "plain_text", text: btnText },
                     style: "primary",
                     action_id: "accept_task",
                     value: buttonPayload
@@ -96,7 +104,7 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
                     action_id: "skip_task",
                     value: "skip"
                 },
-                 {
+                {
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
@@ -105,12 +113,12 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
             ]
         });
 
-        // 3. Link Context (ONLY for updates)
+        // 3. Link for updates (Separate line at bottom)
         if (task.action === 'UPDATE' && task.notion_url && task.notion_url !== "New Task") {
             taskBlocks.push({
                 type: "context",
                 elements: [
-                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|See original page in Notion>` }
+                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open Original Notion Page>` }
                 ]
             });
         }
@@ -119,45 +127,38 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         return taskBlocks;
     };
 
-    // --- GROUP 1: NEW TASKS ---
+    // --- RENDER THE BLOCKS ---
+
     if (newTasks.length > 0) {
         blocks.push({
-            type: "header",
-            text: { type: "plain_text", text: `✨ Proposed New Tasks (${newTasks.length})`, emoji: true }
+            type: "section",
+            text: { type: "mrkdwn", text: `*✨ PROPOSED NEW TASKS (${newTasks.length})*` }
         });
-        
-        newTasks.forEach(task => {
-            blocks.push(...generateTaskBlocks(task));
-        });
+        newTasks.forEach(task => blocks.push(...generateTaskBlocks(task)));
     }
 
-    // --- GROUP 2: UPDATES ---
     if (updateTasks.length > 0) {
         blocks.push({
-            type: "header",
-            text: { type: "plain_text", text: `🔄 Updates to Existing Tasks (${updateTasks.length})`, emoji: true }
+            type: "section",
+            text: { type: "mrkdwn", text: `*🔄 UPDATES TO EXISTING TASKS (${updateTasks.length})*` }
         });
-        
-        updateTasks.forEach(task => {
-            blocks.push(...generateTaskBlocks(task));
-        });
+        updateTasks.forEach(task => blocks.push(...generateTaskBlocks(task)));
     }
 
-    // If no tasks found at all
     if (newTasks.length === 0 && updateTasks.length === 0) {
         blocks.push({
             type: "section",
-            text: { type: "mrkdwn", text: "_No relevant tasks found in this transcript._" }
+            text: { type: "mrkdwn", text: "_No tasks identified in this transcript._" }
         });
     }
 
     try {
         await slackClient.chat.postMessage({
             channel: SLACK_CHANNEL,
-            text: `Sync Report for ${meetingTitle}`, // Fallback notification text
+            text: `Sync Report: ${meetingTitle}`,
             blocks: blocks
         });
-        console.log(`✅ Structured task list sent to Slack channel: ${SLACK_CHANNEL}`);
+        console.log(`✅ Detailed task report sent to Slack.`);
     } catch (error) {
         console.error("❌ Failed to send Slack message:", error.message);
     }
@@ -390,64 +391,69 @@ const queryNotionDB = async (extractedProjects) => {
 
 // --- AI AGENT 2 (STEP 4): TASK GENERATION/COMPARISON ---
 
+// --- UPDATED: CAPTURE EXTRA FIELDS (Owner, Priority, JTBD) ---
 const generateTaskList = async (normalizedData, notionContext) => {
     
     // 1. Flatten the hierarchical AI-extracted tasks into a single list
     const allAIExtractedTasks = normalizedData.extracted_entities.projects.flatMap(p => 
       p.tasks.map(t => ({
-  title: t.task_title,
-  project: p.project_name,
-  notes: t.notes,
-  status: t.status,
-  owner: t.owner,
-  proposal_type: t.proposal_type,
-  transcript_id: normalizedData.transcript_id
-}))
-
+        title: t.task_title,
+        project: p.project_name,
+        notes: t.notes,
+        status: t.status,
+        // CAPTURE THE EXTRA FIELDS HERE:
+        owner: t.owner || "Unassigned",
+        priority: t.priority_level || "Medium",
+        linked_jtbd: t.linked_jtbd?.name || "TBD",
+        proposal_type: t.proposal_type,
+        transcript_id: normalizedData.transcript_id
+      }))
     );
     
     const taskList = [];
 
     // 2. Identify and mark New Tasks
     for (const aiTask of allAIExtractedTasks) {
-        // Check if a similar task title exists in the Notion context
         const existingNotionTask = notionContext.existing_tasks.find(notionTask => 
-            // Simple string matching for title similarity
             notionTask.title.toLowerCase().includes(aiTask.title.toLowerCase()) || 
             aiTask.title.toLowerCase().includes(notionTask.title.toLowerCase())
         );
 
         if (existingNotionTask) {
-            // Task already exists (Match Found)
-            // ACTION: UPDATE - Preserve the existing status from Notion
+            // ACTION: UPDATE
             taskList.push({
                 ...existingNotionTask,
-                update_details: `Mentioned again in meeting: ${normalizedData.meeting_title}. Current Status: ${existingNotionTask.status}`,
+                // Keep new AI data for the update suggestion
+                notes: aiTask.notes,
+                priority: aiTask.priority,
+                owner: aiTask.owner,
+                linked_jtbd: aiTask.linked_jtbd,
                 action: 'UPDATE',
                 transcript_id: normalizedData.transcript_id
             });
-
-            // Remove it from the existing_tasks list so we don't process it twice
+            
+            // Remove from search pool
             notionContext.existing_tasks = notionContext.existing_tasks.filter(
                 t => t.task_id !== existingNotionTask.task_id
             );
 
         } else {
-            // Task is brand new (No Match Found)
-            // ACTION: CREATE - Assign a default 'To Do' status
+            // ACTION: CREATE
             taskList.push({
                 temp_id: crypto.randomBytes(4).toString('hex'),
                 title: aiTask.title,
                 project: aiTask.project,
-                description: `ACTION ITEM from meeting: ${normalizedData.meeting_title}.`,
                 action: 'CREATE',
-                status: 'To do', // Default status for new tasks
+                status: 'To do', 
+                owner: aiTask.owner,
+                priority: aiTask.priority,
+                linked_jtbd: aiTask.linked_jtbd,
+                notes: aiTask.notes,
                 transcript_id: normalizedData.transcript_id
             });
         }
     }
     
-    console.log(`  -> Generated Task List: ${taskList.filter(t => t.action === 'CREATE').length} new, ${taskList.filter(t => t.action === 'UPDATE').length} updates.`);
     return taskList;
 };
 
