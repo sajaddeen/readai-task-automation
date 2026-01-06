@@ -392,6 +392,7 @@ const queryNotionDB = async (extractedProjects) => {
 // --- AI AGENT 2 (STEP 4): TASK GENERATION/COMPARISON ---
 
 // --- UPDATED: CAPTURE EXTRA FIELDS (Owner, Priority, JTBD) ---
+// --- UPDATED: GENERATE TASK LIST (With Fallbacks for Missing Data) ---
 const generateTaskList = async (normalizedData, notionContext) => {
     
     // 1. Flatten the hierarchical AI-extracted tasks into a single list
@@ -399,13 +400,13 @@ const generateTaskList = async (normalizedData, notionContext) => {
       p.tasks.map(t => ({
         title: t.task_title,
         project: p.project_name,
+        // Use logic to handle empty AI fields
+        owner: t.owner && t.owner !== "" ? t.owner : "Unassigned", 
+        priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
+        linked_jtbd: t.linked_jtbd?.name && t.linked_jtbd.name !== "TBD" ? t.linked_jtbd.name : "TBD",
+        proposal_type: t.proposal_type,
         notes: t.notes,
         status: t.status,
-        // CAPTURE THE EXTRA FIELDS HERE:
-        owner: t.owner || "Unassigned",
-        priority: t.priority_level || "Medium",
-        linked_jtbd: t.linked_jtbd?.name || "TBD",
-        proposal_type: t.proposal_type,
         transcript_id: normalizedData.transcript_id
       }))
     );
@@ -423,16 +424,15 @@ const generateTaskList = async (normalizedData, notionContext) => {
             // ACTION: UPDATE
             taskList.push({
                 ...existingNotionTask,
-                // Keep new AI data for the update suggestion
                 notes: aiTask.notes,
-                priority: aiTask.priority,
-                owner: aiTask.owner,
+                priority: aiTask.priority, // Pass the priority
+                owner: aiTask.owner,       // Pass the owner
                 linked_jtbd: aiTask.linked_jtbd,
                 action: 'UPDATE',
                 transcript_id: normalizedData.transcript_id
             });
             
-            // Remove from search pool
+            // Remove from search pool to avoid duplicates
             notionContext.existing_tasks = notionContext.existing_tasks.filter(
                 t => t.task_id !== existingNotionTask.task_id
             );
@@ -445,8 +445,8 @@ const generateTaskList = async (normalizedData, notionContext) => {
                 project: aiTask.project,
                 action: 'CREATE',
                 status: 'To do', 
-                owner: aiTask.owner,
-                priority: aiTask.priority,
+                owner: aiTask.owner,       // Pass the owner
+                priority: aiTask.priority, // Pass the priority
                 linked_jtbd: aiTask.linked_jtbd,
                 notes: aiTask.notes,
                 transcript_id: normalizedData.transcript_id
