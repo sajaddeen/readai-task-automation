@@ -32,33 +32,34 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         return;
     }
 
-    const createdCount = taskList.filter(t => t.action === 'CREATE').length;
-    const updatedCount = taskList.filter(t => t.action === 'UPDATE').length;
+    // 1. Split the tasks into two groups
+    const newTasks = taskList.filter(t => t.action === 'CREATE');
+    const updateTasks = taskList.filter(t => t.action === 'UPDATE');
 
-    // Build blocks for a professional Slack message
-    const blocks = [
-        {
-            type: "header",
-            text: {
-                type: "plain_text",
-                text: `📝 Sync Report: ${meetingTitle}`,
-                emoji: true
-            }
-        },
-        {
-            type: "section",
-            text: {
-                type: "mrkdwn",
-                text: `*Status:* Identification Complete\n*Summary:* 🆕 ${createdCount} New Tasks | 🔄 ${updatedCount} Updates\n*Target DB:* ${targetDbId ? 'Dynamic Match' : 'Default'}`
-            }
-        },
-        { type: "divider" }
-    ];
+    const blocks = [];
 
-    // Add individual task sections WITH BUTTONS
-    taskList.forEach((task, index) => {
-        const icon = task.action === 'CREATE' ? '🟢' : '🔵';
-        let taskText = `${icon} *${task.title}*\n*Status:* ${task.status}\n*Notes:* ${task.notes}`;
+    // --- MAIN HEADER ---
+    blocks.push({
+        type: "header",
+        text: {
+            type: "plain_text",
+            text: `📝 Sync Report: ${meetingTitle}`,
+            emoji: true
+        }
+    });
+
+    blocks.push({
+        type: "context",
+        elements: [
+            { type: "mrkdwn", text: `*Target Database:* ${targetDbId ? 'Dynamic Match' : 'Default'}` }
+        ]
+    });
+
+    blocks.push({ type: "divider" });
+
+    // --- HELPER TO GENERATE TASK BLOCKS ---
+    const generateTaskBlocks = (task) => {
+        const taskBlocks = [];
         
         // Prepare the payload for the button (Embed Task Data + Target DB ID)
         // We limit payload size by truncating notes if necessary to avoid Slack 2000 char limit errors
@@ -68,59 +69,95 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
             notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
         });
 
-        // 1. Task Info Block
-        blocks.push({
+        // 1. Task Details
+        const icon = task.action === 'CREATE' ? '✨' : '🔄';
+        taskBlocks.push({
             type: "section",
-            text: { type: "mrkdwn", text: taskText }
+            text: {
+                type: "mrkdwn",
+                text: `${icon} *${task.title}*\n*Reasoning:* ${task.notes}\n*Status:* \`${task.status}\``
+            }
         });
 
-        // 2. Action Buttons Block (Accept / Skip / Feedback)
-        blocks.push({
+        // 2. Action Buttons (Accept / Skip)
+        taskBlocks.push({
             type: "actions",
             elements: [
                 {
                     type: "button",
-                    text: { type: "plain_text", text: `✅ Accept & ${task.action === 'CREATE' ? 'Create' : 'Update'}` },
-                    style: "primary", // Green button
+                    text: { type: "plain_text", text: task.action === 'CREATE' ? "✅ Accept & Create" : "✅ Accept & Update" },
+                    style: "primary",
                     action_id: "accept_task",
-                    value: buttonPayload // Stores all data needed to run the logic later
+                    value: buttonPayload
                 },
                 {
                     type: "button",
                     text: { type: "plain_text", text: "⏭️ Skip" },
                     action_id: "skip_task",
-                    value: "skip" // We just need to know to skip
+                    value: "skip"
                 },
-                {
+                 {
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
-                    value: "feedback" // Placeholder for feedback modal
+                    value: "feedback"
                 }
             ]
         });
 
-        // 3. Link Context (if exists)
-        if (task.notion_url && task.notion_url !== "New Task") {
-            blocks.push({
+        // 3. Link Context (ONLY for updates)
+        if (task.action === 'UPDATE' && task.notion_url && task.notion_url !== "New Task") {
+            taskBlocks.push({
                 type: "context",
                 elements: [
-                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open Existing Page in Notion>` }
+                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|See original page in Notion>` }
                 ]
             });
         }
+
+        taskBlocks.push({ type: "divider" });
+        return taskBlocks;
+    };
+
+    // --- GROUP 1: NEW TASKS ---
+    if (newTasks.length > 0) {
+        blocks.push({
+            type: "header",
+            text: { type: "plain_text", text: `✨ Proposed New Tasks (${newTasks.length})`, emoji: true }
+        });
         
-        // Divider between tasks
-        blocks.push({ type: "divider" });
-    });
+        newTasks.forEach(task => {
+            blocks.push(...generateTaskBlocks(task));
+        });
+    }
+
+    // --- GROUP 2: UPDATES ---
+    if (updateTasks.length > 0) {
+        blocks.push({
+            type: "header",
+            text: { type: "plain_text", text: `🔄 Updates to Existing Tasks (${updateTasks.length})`, emoji: true }
+        });
+        
+        updateTasks.forEach(task => {
+            blocks.push(...generateTaskBlocks(task));
+        });
+    }
+
+    // If no tasks found at all
+    if (newTasks.length === 0 && updateTasks.length === 0) {
+        blocks.push({
+            type: "section",
+            text: { type: "mrkdwn", text: "_No relevant tasks found in this transcript._" }
+        });
+    }
 
     try {
         await slackClient.chat.postMessage({
             channel: SLACK_CHANNEL,
-            text: `Tasks identified for ${meetingTitle}`, // Fallback text
+            text: `Sync Report for ${meetingTitle}`, // Fallback notification text
             blocks: blocks
         });
-        console.log(`✅ Task list successfully sent to Slack channel: ${SLACK_CHANNEL}`);
+        console.log(`✅ Structured task list sent to Slack channel: ${SLACK_CHANNEL}`);
     } catch (error) {
         console.error("❌ Failed to send Slack message:", error.message);
     }
