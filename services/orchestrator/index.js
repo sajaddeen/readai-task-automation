@@ -6,7 +6,13 @@ const multer = require('multer');
 const mammoth = require('mammoth'); // Dependency required for DOCX
 
 const PORT = process.env.ORCHESTRATOR_PORT || 3000;
-const MCP_SERVER_URL = `http://localhost:${process.env.MCP_PORT || 3001}`;
+//const MCP_SERVER_URL = `http://localhost:${process.env.MCP_PORT || 3001}`;
+const MCP_SERVER_URL = process.env.MCP_SERVER_URL;
+
+if (!MCP_SERVER_URL) {
+  throw new Error("MCP_SERVER_URL is not defined");
+}
+
 
 const app = express();
 
