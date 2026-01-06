@@ -14,7 +14,7 @@ const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
-const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID;
+const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
 const PORT = process.env.MCP_PORT || 3001;
 const app = express();
 
@@ -24,9 +24,9 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true })); 
 
 
-// --- NEW: SLACK MESSAGING HELPER ---
+// --- NEW: SLACK MESSAGING HELPER WITH BUTTONS ---
 
-const sendTaskListToSlack = async (taskList, meetingTitle) => {
+const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
         console.warn("\n⚠️ SLACK CONFIG MISSING: Skipping Slack notification.");
         return;
@@ -49,30 +49,69 @@ const sendTaskListToSlack = async (taskList, meetingTitle) => {
             type: "section",
             text: {
                 type: "mrkdwn",
-                text: `*Status:* Identification Complete\n*Summary:* 🆕 ${createdCount} New Tasks | 🔄 ${updatedCount} Updates`
+                text: `*Status:* Identification Complete\n*Summary:* 🆕 ${createdCount} New Tasks | 🔄 ${updatedCount} Updates\n*Target DB:* ${targetDbId ? 'Dynamic Match' : 'Default'}`
             }
         },
         { type: "divider" }
     ];
 
-    // Add individual task sections
-    taskList.forEach((task) => {
+    // Add individual task sections WITH BUTTONS
+    taskList.forEach((task, index) => {
         const icon = task.action === 'CREATE' ? '🟢' : '🔵';
         let taskText = `${icon} *${task.title}*\n*Status:* ${task.status}\n*Notes:* ${task.notes}`;
         
+        // Prepare the payload for the button (Embed Task Data + Target DB ID)
+        // We limit payload size by truncating notes if necessary to avoid Slack 2000 char limit errors
+        const buttonPayload = JSON.stringify({
+            ...task,
+            targetDbId: targetDbId || NOTION_TASK_DB_ID,
+            notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
+        });
+
+        // 1. Task Info Block
         blocks.push({
             type: "section",
             text: { type: "mrkdwn", text: taskText }
         });
 
+        // 2. Action Buttons Block (Accept / Skip / Feedback)
+        blocks.push({
+            type: "actions",
+            elements: [
+                {
+                    type: "button",
+                    text: { type: "plain_text", text: `✅ Accept & ${task.action === 'CREATE' ? 'Create' : 'Update'}` },
+                    style: "primary", // Green button
+                    action_id: "accept_task",
+                    value: buttonPayload // Stores all data needed to run the logic later
+                },
+                {
+                    type: "button",
+                    text: { type: "plain_text", text: "⏭️ Skip" },
+                    action_id: "skip_task",
+                    value: "skip" // We just need to know to skip
+                },
+                {
+                    type: "button",
+                    text: { type: "plain_text", text: "💬 Feedback" },
+                    action_id: "feedback_task",
+                    value: "feedback" // Placeholder for feedback modal
+                }
+            ]
+        });
+
+        // 3. Link Context (if exists)
         if (task.notion_url && task.notion_url !== "New Task") {
             blocks.push({
                 type: "context",
                 elements: [
-                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open in Notion>` }
+                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open Existing Page in Notion>` }
                 ]
             });
         }
+        
+        // Divider between tasks
+        blocks.push({ type: "divider" });
     });
 
     try {
@@ -312,12 +351,6 @@ const queryNotionDB = async (extractedProjects) => {
     }
 };
 
-// --- NOTION/SLACK HANDLERS (Simplified/Mocked) ---
-
-const updateNotionDB = async (taskList) => {
-    console.log(`\n[Notion] Mock: Updating database with ${taskList.length} tasks...`);
-};
-
 // --- AI AGENT 2 (STEP 4): TASK GENERATION/COMPARISON ---
 
 const generateTaskList = async (normalizedData, notionContext) => {
@@ -476,20 +509,110 @@ app.get('/api/v1/list-notion-databases', async (req, res) => {
 
 // --- MCP SERVER API ENDPOINTS ---
 
+// --- REPLACED: NEW INTERACTIVE SLACK ENDPOINT ---
 app.post('/api/v1/slack-interaction', async (req, res) => {
-    res.status(200).send({ message: "Mock interaction received." });
+    try {
+        // Slack sends the payload as a stringified JSON inside 'payload' body param
+        const payload = JSON.parse(req.body.payload);
+        const action = payload.actions[0];
+        
+        // IMPORTANT: Slack expects a 200 OK immediately, or it shows an error to user.
+        // We will do the work, then send a response URL update if needed, but for now lets just await the work.
+        
+        if (action.action_id === 'accept_task') {
+            const taskData = JSON.parse(action.value); // Recover the full data we hid in the button
+            const dbId = taskData.targetDbId || NOTION_TASK_DB_ID;
+
+            if (taskData.action === 'CREATE') {
+                // Perform Notion CREATE
+                console.log(`[Slack Action] Creating new task in Notion DB: ${dbId}`);
+                await notion.pages.create({
+                    parent: { database_id: dbId },
+                    properties: {
+                        "Title": { title: [{ text: { content: taskData.title } }] },
+                        "Status": { select: { name: taskData.status || "To Do" } },
+                        "Project": { rich_text: [{ text: { content: taskData.project || "General" } }] },
+                        "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] }
+                    }
+                });
+                
+                // Update Slack Message to show success
+                res.status(200).json({
+                    replace_original: "true",
+                    text: `✅ *Created:* ${taskData.title} in Notion.`
+                });
+
+            } else if (taskData.action === 'UPDATE') {
+                // Perform Notion UPDATE
+                // We need the Page ID. For updates, we look at the notion_url or pass page_id in payload.
+                // Assuming notion_url contains the ID (standard Notion format: notion.so/Title-ID)
+                
+                // Helper to extract ID from URL if not passed explicitly. 
+                // However, our logic upstream passed the whole 'task' object.
+                // If 'id' key exists in task object use it, else parse URL.
+                let pageId = taskData.id; 
+                
+                if (!pageId && taskData.notion_url) {
+                    // Quick regex to grab the 32 char hex at end of URL
+                    const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
+                    if(matches) pageId = matches[0];
+                }
+
+                if (pageId) {
+                    console.log(`[Slack Action] Updating Page ID: ${pageId}`);
+                    await notion.pages.update({
+                        page_id: pageId,
+                        properties: {
+                             // Example: Update status to 'In Progress' or keep existing
+                            "Status": { select: { name: taskData.status } },
+                            // Append to notes (optional strategy)
+                             "Notes": { rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] }
+                        }
+                    });
+
+                    res.status(200).json({
+                        replace_original: "true",
+                        text: `✅ *Updated:* ${taskData.title} in Notion.`
+                    });
+                } else {
+                     res.status(400).send("Could not determine Page ID for update.");
+                }
+            }
+
+        } else if (action.action_id === 'skip_task') {
+            // Handle Skip
+             res.status(200).json({
+                replace_original: "true",
+                text: `⏭️ *Skipped:* Task ignored.`
+            });
+
+        } else if (action.action_id === 'feedback_task') {
+            // Handle Feedback (Placeholder)
+            res.status(200).json({
+                replace_original: "false", // Don't delete the buttons yet
+                text: `📝 Feedback noted. (Modal logic to be implemented)`
+            });
+        } else {
+            res.status(200).send();
+        }
+
+    } catch (error) {
+        console.error("Slack Interaction Error:", error.message);
+        res.status(500).send("Error processing interaction");
+    }
 });
 
 
 app.post('/api/v1/slack-approved-tasks', async (req, res) => {
+    // This was your old endpoint for bulk approval, leaving it as requested.
     const approvedTasks = req.body.tasks; 
     
     if (!approvedTasks || approvedTasks.length === 0) {
         return res.status(400).send({ message: "No tasks provided for update." });
     }
     try {
-        await updateNotionDB(approvedTasks);
-        res.status(200).send({ message: 'Notion database updated based on Slack approval.' });
+        // await updateNotionDB(approvedTasks); // This function was mocked in your snippet
+        res.status(200).send({ message: 'Legacy endpoint: Notion database update logic moved to interactive buttons.' });
     } catch (error) {
         console.error('Failed to process approved tasks:', error.message);
         res.status(500).send({ message: 'Failed to update Notion DB.' });
@@ -742,8 +865,9 @@ finalOutput.push(parsed);
       }
     }
 
-    // --- 6) SEND TO SLACK ---
-    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting");
+    // --- 6) SEND TO SLACK WITH BUTTONS AND TARGET DB ID ---
+    // UPDATED CALL: We now pass the match.id (Target DB ID) to the Slack helper
+    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting", match.id);
 
     // --- 7) Return results ---
     return res.status(200).send(finalOutput);
