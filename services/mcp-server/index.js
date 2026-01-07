@@ -569,9 +569,9 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 await notion.pages.create({
                     parent: { database_id: dbId },
                     properties: {
-                        // 1. Title
+                        // 1. Tasks
                         "Tasks": { 
-                            title: [{ text: { content: taskData.title } }] 
+                            tasks: [{ text: { content: taskData.tasks } }] 
                         },
                         
                         // 2. Status
@@ -638,9 +638,9 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     await notion.pages.update({
                         page_id: pageId,
                         properties: {
-                            // 1. Title
+                            // 1. Tasks
                             "Tasks": { 
-                                title: [{ text: { content: taskData.title } }] 
+                                tasks: [{ text: { content: taskData.tasks } }] 
                             },
 
                             // 2. Status (Using 'status' type as verified previously)
@@ -833,11 +833,11 @@ if (!allSources || allSources.length === 0) {
 }
 
 // --- 3) Find best matching DB using GPT ---
-let chosenTitle = await findBestDatabaseMatch(projectName, allSources);
+let chosenTasks = await findBestDatabaseMatch(projectName, allSources);
 
 // Fallback: simple contains match
 if (!chosenTitle) {
-  chosenTitle = allSources.find(ds =>
+  chosenTasks = allSources.find(ds =>
     ds.title.toLowerCase().includes(projectName.toLowerCase())
   )?.title;
 }
@@ -846,7 +846,7 @@ if (!chosenTitle) {
   return res.status(404).send({ error: "No matching Notion DB found." });
 }
 
-const match = allSources.find(ds => ds.title === chosenTitle);
+const match = allSources.find(ds => ds.tasks === chosenTasks);
 
 console.log(
   `[Notion] Best DB match for project "${projectName}": "${match.title}" (ID: ${match.id})`
@@ -987,7 +987,7 @@ finalOutput.push(parsed);
 
     // --- 6) SEND TO SLACK WITH BUTTONS AND TARGET DB ID ---
     // UPDATED CALL: We now pass the match.id (Target DB ID) to the Slack helper
-    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting", match.id);
+    await sendTaskListToSlack(finalOutput, meeting_tasks || "Virtual Meeting", match.id);
 
     // --- 7) Return results ---
     return res.status(200).send(finalOutput);
