@@ -570,7 +570,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     parent: { database_id: dbId },
                     properties: {
                         // 1. Title
-                        "Title": { 
+                        "Tasks": { 
                             title: [{ text: { content: taskData.title } }] 
                         },
                         
@@ -639,7 +639,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                         page_id: pageId,
                         properties: {
                             // 1. Title
-                            "Title": { 
+                            "Tasks": { 
                                 title: [{ text: { content: taskData.title } }] 
                             },
 
