@@ -983,7 +983,7 @@ finalOutput.push(parsed);
 // Start the server
 const startServer = async () => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
-        console.warn("\n⚠️ NOTION KEYS MISSING: Notion integration will be mocked.");
+        console.warn("\n NOTION KEYS MISSING: Notion integration will be mocked.");
     }
     
     await connectDB();
