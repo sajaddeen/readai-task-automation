@@ -8,11 +8,8 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
-
-// IMPORTANT: We rely on the global mongoose instance exported from shared-config
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
 const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
 const PORT = process.env.MCP_PORT || 3001;
@@ -572,10 +569,45 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 await notion.pages.create({
                     parent: { database_id: dbId },
                     properties: {
-                        "Title": { title: [{ text: { content: taskData.title } }] },
-                        "Status": { status: { name: taskData.status || "To Do" } },
-                        "Project": { rich_text: [{ text: { content: taskData.project || "General" } }] },
-                        "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] }
+                        // 1. Title
+                        "Title": { 
+                            title: [{ text: { content: taskData.title } }] 
+                        },
+                        
+                        // 2. Status
+                        "Status": { 
+                            status: { name: taskData.status || "To do" } 
+                        },
+                        
+                        // 3. Project
+                        "Project": { 
+                            rich_text: [{ text: { content: taskData.project || "General" } }] 
+                        },
+                        
+                        // 4. Linked JTBD
+                        "Linked JTBD": { 
+                            rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
+                        },
+
+                        // 5. Owner
+                        "Owner": { 
+                            rich_text: [{ text: { content: taskData.owner || "" } }] 
+                        },
+
+                        // 6. Priority Level
+                        "Priority Level": { 
+                            select: { name: taskData.priority || "Medium" } 
+                        },
+
+                        // 7. Source
+                        "Source": { 
+                            select: { name: "Virtual Meeting" } 
+                        },
+
+                        // 8. Notes
+                        "Notes": { 
+                            rich_text: [{ text: { content: taskData.notes || "" } }] 
+                        }
                     }
                 });
                 
@@ -606,10 +638,40 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     await notion.pages.update({
                         page_id: pageId,
                         properties: {
-                             // Example: Update status to 'In Progress' or keep existing
-                            "Status": { status: { name: taskData.status } },
-                            // Append to notes (optional strategy)
-                             "Notes": { rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] }
+                            // 1. Title
+                            "Title": { 
+                                title: [{ text: { content: taskData.title } }] 
+                            },
+
+                            // 2. Status (Using 'status' type as verified previously)
+                            "Status": { 
+                                status: { name: taskData.status } 
+                            },
+
+                            // 3. Linked JTBD (Assumed Rich Text)
+                            "Linked JTBD": { 
+                                rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
+                            },
+
+                            // 4. Owner (Assumed Rich Text. If 'Person' type, this needs to be a User ID)
+                            "Owner": { 
+                                rich_text: [{ text: { content: taskData.owner || "" } }] 
+                            },
+
+                            // 5. Priority Level (Assumed Select)
+                            "Priority Level": { 
+                                select: { name: taskData.priority || "Medium" } 
+                            },
+
+                            // 6. Source (Assumed Select or Multi-select)
+                            "Source": { 
+                                select: { name: "Virtual Meeting" } 
+                            },
+
+                            // 7. Notes (Appending update tag)
+                            "Notes": { 
+                                rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
+                            }
                         }
                     });
 
