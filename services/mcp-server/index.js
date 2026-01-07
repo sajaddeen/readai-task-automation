@@ -1,15 +1,19 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+// FIX: We no longer need the OpenAI package, only the mongoose instance and connection
 const { connectDB } = require('@read-ai/shared-config');
 const mongoose = require('mongoose');
 const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
+// Ensure these utility files exist in your project structure
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
+
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
 const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
 const PORT = process.env.MCP_PORT || 3001;
@@ -23,7 +27,6 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // --- NEW: SLACK MESSAGING HELPER WITH BUTTONS ---
 
-// --- UPDATED: SLACK MESSAGE WITH VERTICAL LIST FORMAT ---
 const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
         console.warn("\n⚠️ SLACK CONFIG MISSING: Skipping Slack notification.");
@@ -61,7 +64,6 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         const typeLabel = task.action === 'CREATE' ? "Create new Task" : "Update existing Task";
 
         // --- THE FORMATTING MAGIC IS HERE ---
-        // We use \n for new lines. We add \n\n before Notes to give it breathing room.
         const detailsText = 
 `*Proposal type:* ${typeLabel}
 *Task title:* ${task.title}
@@ -172,7 +174,7 @@ const normalizeTranscript = async (transcript, initialData) => {
         throw new Error("OpenAI API Key is missing from environment variables.");
     }
     
-    // Schema definition (matches the updated Mongoose Schema)
+    // Schema definition
    const jsonFormatSchema = {
   "transcript_id": crypto.randomBytes(16).toString("hex"),
   "source": initialData.source,
@@ -343,37 +345,26 @@ const queryNotionDB = async (extractedProjects) => {
         return { existing_tasks: [] };
     }
 
-    const projectNames = extractedProjects.map(p => p.project_name).filter(Boolean);
+    // REMOVED PROJECT FILTERING: Since 'Project' column might not exist, 
+    // we will query the DB directly without filtering by Project name to prevent crashes.
     
-    if (projectNames.length === 0) {
-        return { existing_tasks: [] };
-    }
-
-    const projectFilters = projectNames.map(name => ({
-        property: 'Project',
-        rich_text: {
-            contains: name
-        }
-    }));
-    
-    const filter = {
-        or: projectFilters
-    };
-
-    console.log(`\n[Notion] Querying database for ${projectNames.length} project(s)...`);
+    console.log(`\n[Notion] Querying database...`);
     
     try {
         const response = await notion.dataSources.query({
             database_id: NOTION_TASK_DB_ID,
-            filter: filter,
-            properties: ['Title', 'Status', 'Project'], 
+            // Removed 'filter' so it doesn't crash on missing 'Project' column
+            // We only ask for 'Tasks' and 'Status' properties
+            properties: ['Tasks', 'Status'], 
         });
 
         const existingTasks = response.results.map(page => ({
             task_id: page.id,
-            title: page.properties.Title?.title[0]?.plain_text || 'No Title',
-            project: page.properties.Project?.rich_text[0]?.plain_text || 'Unassigned',
-            status: page.properties.Status?.select?.name || 'Unknown',
+            // FIX: Map from 'Tasks' property
+            title: page.properties.Tasks?.title[0]?.plain_text || 'No Title',
+            // Defaulting project to Unassigned since column is gone
+            project: 'Unassigned',
+            status: page.properties.Status?.status?.name || 'Unknown',
             action: 'UPDATE', 
         }));
 
@@ -388,8 +379,6 @@ const queryNotionDB = async (extractedProjects) => {
 
 // --- AI AGENT 2 (STEP 4): TASK GENERATION/COMPARISON ---
 
-// --- UPDATED: CAPTURE EXTRA FIELDS (Owner, Priority, JTBD) ---
-// --- UPDATED: GENERATE TASK LIST (With Fallbacks for Missing Data) ---
 const generateTaskList = async (normalizedData, notionContext) => {
     
     // 1. Flatten the hierarchical AI-extracted tasks into a single list
@@ -397,7 +386,7 @@ const generateTaskList = async (normalizedData, notionContext) => {
       p.tasks.map(t => ({
         title: t.task_title,
         project: p.project_name,
-        // Use logic to handle empty AI fields
+        // Use logic to handle empty AI fields with Defaults
         owner: t.owner && t.owner !== "" ? t.owner : "Unassigned", 
         priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
         linked_jtbd: t.linked_jtbd?.name && t.linked_jtbd.name !== "TBD" ? t.linked_jtbd.name : "TBD",
@@ -569,9 +558,9 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 await notion.pages.create({
                     parent: { database_id: dbId },
                     properties: {
-                        // 1. Tasks
+                        // 1. Tasks (Title property renamed to 'Tasks' in Notion)
                         "Tasks": { 
-                            tasks: [{ text: { content: taskData.tasks } }] 
+                            title: [{ text: { content: taskData.title } }] 
                         },
                         
                         // 2. Status
@@ -579,17 +568,14 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                             status: { name: taskData.status || "To do" } 
                         },
                         
-                        // 3. Project
-                        "Project": { 
-                            rich_text: [{ text: { content: taskData.project || "General" } }] 
-                        },
+                        // 3. REMOVED PROJECT (Option B)
                         
-                        // 4. Linked JTBD
+                        // 4. Jobs (Mapped from Linked JTBD, now Text)
                         "Jobs": { 
                             rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
                         },
 
-                        // 5. Owner
+                        // 5. Owner (Now Text)
                         "Owner": { 
                             rich_text: [{ text: { content: taskData.owner || "" } }] 
                         },
@@ -619,16 +605,11 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
 
             } else if (taskData.action === 'UPDATE') {
                 // Perform Notion UPDATE
-                // We need the Page ID. For updates, we look at the notion_url or pass page_id in payload.
-                // Assuming notion_url contains the ID (standard Notion format: notion.so/Title-ID)
                 
                 // Helper to extract ID from URL if not passed explicitly. 
-                // However, our logic upstream passed the whole 'task' object.
-                // If 'id' key exists in task object use it, else parse URL.
                 let pageId = taskData.id; 
                 
                 if (!pageId && taskData.notion_url) {
-                    // Quick regex to grab the 32 char hex at end of URL
                     const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
                     if(matches) pageId = matches[0];
                 }
@@ -638,37 +619,39 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     await notion.pages.update({
                         page_id: pageId,
                         properties: {
-                            // 1. Tasks
+                            // 1. Tasks (Title)
                             "Tasks": { 
-                                tasks: [{ text: { content: taskData.tasks } }] 
+                                title: [{ text: { content: taskData.title } }] 
                             },
 
-                            // 2. Status (Using 'status' type as verified previously)
+                            // 2. Status
                             "Status": { 
                                 status: { name: taskData.status } 
                             },
 
-                            // 3. Linked JTBD (Assumed Rich Text)
+                            // 3. REMOVED PROJECT (Option B)
+
+                            // 4. Jobs (JTBD)
                             "Jobs": { 
                                 rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
                             },
 
-                            // 4. Owner (Assumed Rich Text. If 'Person' type, this needs to be a User ID)
+                            // 5. Owner
                             "Owner": { 
                                 rich_text: [{ text: { content: taskData.owner || "" } }] 
                             },
 
-                            // 5. Priority Level (Assumed Select)
+                            // 6. Priority Level
                             "Priority Level": { 
                                 select: { name: taskData.priority || "Medium" } 
                             },
 
-                            // 6. Source (Assumed Select or Multi-select)
+                            // 7. Source
                             "Source": { 
                                 select: { name: "Virtual Meeting" } 
                             },
 
-                            // 7. Notes (Appending update tag)
+                            // 8. Notes
                             "Notes": { 
                                 rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
                             }
@@ -779,8 +762,6 @@ app.post('/api/v1/generate-tasks', async (req, res) => {
         // STEP 4: Generate/Compare Task List
         const taskList = await generateTaskList(normalized_data, actualNotionContext);
 
-        // await sendToSlackForApproval(taskList, normalized_data.meeting_title); 
-
         res.status(200).send({ message: 'Task list generated and sent to Slack for approval.' });
 
     } catch (error) {
@@ -862,9 +843,10 @@ console.log(
     // Simplify each page (so we only use title, status, notes, url)
     const existingTasks = pages.map(page => ({
   id: page.id || "",
-  title: page.task || "",           // simplified helper gives `task`
+  // FIX: Using 'task' which is derived from 'simplifyAnyPage' mapping (make sure helper handles 'Tasks' col)
+  title: page.task || "",           
   status: page.status || "",
-  notes: page.notes || "",          // if you later add notes in simplifyAnyPage
+  notes: page.notes || "",         
   url: `https://www.notion.so/${(page.id || "").replace(/-/g, "")}`
 }));
 
@@ -986,8 +968,8 @@ finalOutput.push(parsed);
 
 
     // --- 6) SEND TO SLACK WITH BUTTONS AND TARGET DB ID ---
-    // UPDATED CALL: We now pass the match.id (Target DB ID) to the Slack helper
-    await sendTaskListToSlack(finalOutput, meeting_tasks || "Virtual Meeting", match.id);
+    // UPDATED CALL: Pass match.id (Target DB ID)
+    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting", match.id);
 
     // --- 7) Return results ---
     return res.status(200).send(finalOutput);
