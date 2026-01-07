@@ -846,7 +846,7 @@ if (!chosenTitle) {
   return res.status(404).send({ error: "No matching Notion DB found." });
 }
 
-const match = allSources.find(ds => ds.tasks === chosenTitle);
+const match = allSources.find(ds => ds.title === chosenTitle);
 
 console.log(
   `[Notion] Best DB match for project "${projectName}": "${match.title}" (ID: ${match.id})`
