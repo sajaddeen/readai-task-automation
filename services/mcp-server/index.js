@@ -833,11 +833,11 @@ if (!allSources || allSources.length === 0) {
 }
 
 // --- 3) Find best matching DB using GPT ---
-let chosenTasks = await findBestDatabaseMatch(projectName, allSources);
+let chosenTitle = await findBestDatabaseMatch(projectName, allSources);
 
 // Fallback: simple contains match
 if (!chosenTitle) {
-  chosenTasks = allSources.find(ds =>
+  chosenTitle = allSources.find(ds =>
     ds.title.toLowerCase().includes(projectName.toLowerCase())
   )?.title;
 }
@@ -846,7 +846,7 @@ if (!chosenTitle) {
   return res.status(404).send({ error: "No matching Notion DB found." });
 }
 
-const match = allSources.find(ds => ds.tasks === chosenTasks);
+const match = allSources.find(ds => ds.tasks === chosenTitle);
 
 console.log(
   `[Notion] Best DB match for project "${projectName}": "${match.title}" (ID: ${match.id})`
