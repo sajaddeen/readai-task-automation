@@ -33,9 +33,6 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         return;
     }
 
-    const newTasks = taskList.filter(t => t.action === 'CREATE');
-    const updateTasks = taskList.filter(t => t.action === 'UPDATE');
-
     const blocks = [];
 
     // --- MAIN HEADER ---
@@ -50,33 +47,60 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
 
     blocks.push({ type: "divider" });
 
-    // --- HELPER: GENERATE VERTICAL LIST BLOCKS ---
-    const generateTaskBlocks = (task) => {
-        const taskBlocks = [];
+    // --- GENERATE VERTICAL LIST BLOCKS (Proposal X of Y) ---
+    
+    // We iterate through ALL tasks to maintain the "X of Y" count
+    taskList.forEach((task, index) => {
+        const proposalCount = `${index + 1} of ${taskList.length}`;
         
-        // Prepare Button Payload
+        // Prepare Button Payload (Includes new fields)
         const buttonPayload = JSON.stringify({
             ...task,
             targetDbId: targetDbId || NOTION_TASK_DB_ID,
+            // Sanitize notes to fit in button payload limit (3000 chars max usually)
             notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
         });
 
+        // Format Linked JTBD (Slack Link format: <url|text>)
+        const jtbdDisplay = task.linked_jtbd_url && task.linked_jtbd_url.startsWith('http') 
+            ? `<${task.linked_jtbd_url}|${task.linked_jtbd}>`
+            : task.linked_jtbd || "TBD";
+
+        // Format Existing Task URL (for Updates)
+        const existingTaskLine = task.action === 'UPDATE' && task.notion_url && task.notion_url !== "New Task"
+            ? `*Existing task:* <${task.notion_url}|Open Notion Page>`
+            : "";
+
+        // Determine Type Label
         const typeLabel = task.action === 'CREATE' ? "Create new Task" : "Update existing Task";
 
         // --- THE FORMATTING MAGIC IS HERE ---
+        // Matches your requested structure exactly
         const detailsText = 
-`*Proposal type:* ${typeLabel}
+`*Proposal ${proposalCount}*
+
+*Project:* ${task.project || "Unassigned"}
+
+*Proposal type:* ${typeLabel}
 *Task title:* ${task.title}
-*Linked JTBD:* ${task.linked_jtbd || "TBD"}
+
+${existingTaskLine}
+*Linked JTBD:* ${jtbdDisplay}
+
 *Owner:* ${task.owner}
 *Status:* ${task.status}
+*Start Date:* ${task.start_date || "—"}
+*Due Date:* ${task.due_date || "—"}
+
 *Priority Level:* ${task.priority || "Medium"}
 *Source:* Virtual Meeting
+*Focus This Week?:* ${task.focus_this_week || "No"}
 
-*Notes:* ${task.notes}`;
+*Notes:*
+${task.notes}`;
 
         // 1. Add the text block
-        taskBlocks.push({
+        blocks.push({
             type: "section",
             text: {
                 type: "mrkdwn",
@@ -87,7 +111,7 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
         // 2. Action Buttons
         const btnText = task.action === 'CREATE' ? "✅ Accept & Create" : "✅ Accept & Update";
         
-        taskBlocks.push({
+        blocks.push({
             type: "actions",
             elements: [
                 {
@@ -112,39 +136,11 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
             ]
         });
 
-        // 3. Link for updates (Separate line at bottom)
-        if (task.action === 'UPDATE' && task.notion_url && task.notion_url !== "New Task") {
-            taskBlocks.push({
-                type: "context",
-                elements: [
-                    { type: "mrkdwn", text: `🔗 <${task.notion_url}|Open Original Notion Page>` }
-                ]
-            });
-        }
+        blocks.push({ type: "divider" });
+    });
 
-        taskBlocks.push({ type: "divider" });
-        return taskBlocks;
-    };
-
-    // --- RENDER THE BLOCKS ---
-
-    if (newTasks.length > 0) {
-        blocks.push({
-            type: "section",
-            text: { type: "mrkdwn", text: `*✨ PROPOSED NEW TASKS (${newTasks.length})*` }
-        });
-        newTasks.forEach(task => blocks.push(...generateTaskBlocks(task)));
-    }
-
-    if (updateTasks.length > 0) {
-        blocks.push({
-            type: "section",
-            text: { type: "mrkdwn", text: `*🔄 UPDATES TO EXISTING TASKS (${updateTasks.length})*` }
-        });
-        updateTasks.forEach(task => blocks.push(...generateTaskBlocks(task)));
-    }
-
-    if (newTasks.length === 0 && updateTasks.length === 0) {
+    // Handle empty list case
+    if (taskList.length === 0) {
         blocks.push({
             type: "section",
             text: { type: "mrkdwn", text: "_No tasks identified in this transcript._" }
@@ -157,7 +153,7 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
             text: `Sync Report: ${meetingTitle}`,
             blocks: blocks
         });
-        console.log(`✅ Detailed task report sent to Slack.`);
+        console.log(`✅ Detailed task report sent to Slack (${taskList.length} proposals).`);
     } catch (error) {
         console.error("❌ Failed to send Slack message:", error.message);
     }
@@ -174,7 +170,7 @@ const normalizeTranscript = async (transcript, initialData) => {
         throw new Error("OpenAI API Key is missing from environment variables.");
     }
     
-    // Schema definition
+    // Schema definition - UPDATED FOR DATES AND FOCUS
    const jsonFormatSchema = {
   "transcript_id": crypto.randomBytes(16).toString("hex"),
   "source": initialData.source,
@@ -219,7 +215,12 @@ const normalizeTranscript = async (transcript, initialData) => {
             "status": "In progress | Done | To do",
             "priority_level": "High | Medium | Low",
             "source": "Virtual Meeting",
+            
+            // NEW FIELDS
+            "start_date": "YYYY-MM-DD or null",
+            "due_date": "YYYY-MM-DD or null",
             "focus_this_week": "Yes | No",
+            
             "notes": "2–4 sentence paragraph explaining action, context, dependencies, next step"
           }
         ],
@@ -250,6 +251,10 @@ CRITICAL RULES:
 - Every task must belong to EXACTLY ONE project
 - Supported projects: Island Way, Ridge Oak
 - If unsure of project → choose the MOST LIKELY one
+
+CRITICAL NEW RULES (DATES & FOCUS):
+1. **Dates**: Extract concrete dates for 'start_date' and 'due_date' (YYYY-MM-DD). If strictly unknown, use null.
+2. **Focus This Week**: Set to "Yes" ONLY if the speaker explicitly says "this week", "urgent", "immediate", or "do it now". Otherwise "No".
 
 TASK QUALITY REQUIREMENTS:
 - Task titles must be concise and outcome-focused
@@ -393,6 +398,11 @@ const generateTaskList = async (normalizedData, notionContext) => {
         proposal_type: t.proposal_type,
         notes: t.notes,
         status: t.status,
+        // Pass through new fields
+        start_date: t.start_date,
+        due_date: t.due_date,
+        focus_this_week: t.focus_this_week,
+        
         transcript_id: normalizedData.transcript_id
       }))
     );
@@ -411,9 +421,15 @@ const generateTaskList = async (normalizedData, notionContext) => {
             taskList.push({
                 ...existingNotionTask,
                 notes: aiTask.notes,
-                priority: aiTask.priority, // Pass the priority
-                owner: aiTask.owner,       // Pass the owner
+                priority: aiTask.priority, 
+                owner: aiTask.owner,       
                 linked_jtbd: aiTask.linked_jtbd,
+                
+                // Update dates/focus on existing task too
+                start_date: aiTask.start_date,
+                due_date: aiTask.due_date,
+                focus_this_week: aiTask.focus_this_week,
+
                 action: 'UPDATE',
                 transcript_id: normalizedData.transcript_id
             });
@@ -431,10 +447,16 @@ const generateTaskList = async (normalizedData, notionContext) => {
                 project: aiTask.project,
                 action: 'CREATE',
                 status: 'To do', 
-                owner: aiTask.owner,       // Pass the owner
-                priority: aiTask.priority, // Pass the priority
+                owner: aiTask.owner,       
+                priority: aiTask.priority, 
                 linked_jtbd: aiTask.linked_jtbd,
                 notes: aiTask.notes,
+
+                // New fields
+                start_date: aiTask.start_date,
+                due_date: aiTask.due_date,
+                focus_this_week: aiTask.focus_this_week,
+
                 transcript_id: normalizedData.transcript_id
             });
         }
@@ -552,55 +574,66 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             const taskData = JSON.parse(action.value); // Recover the full data we hid in the button
             const dbId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
+            // Helper: Build the Properties Object
+            const notionProperties = {
+                // 1. Tasks (Title property renamed to 'Tasks' in Notion)
+                "Tasks": { 
+                    title: [{ text: { content: taskData.title } }] 
+                },
+                // 2. Status
+                "Status": { 
+                    status: { name: taskData.status || "To do" } 
+                },
+                // 3. REMOVED PROJECT (Option B) - Column not used
+
+                // 4. Jobs (Mapped from Linked JTBD, now Text)
+                "Jobs": { 
+                    rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
+                },
+                // 5. Owner (Now Text)
+                "Owner": { 
+                    rich_text: [{ text: { content: taskData.owner || "" } }] 
+                },
+                // 6. Priority Level
+                "Priority Level": { 
+                    select: { name: taskData.priority || "Medium" } 
+                },
+                // 7. Source
+                "Source": { 
+                    select: { name: "Virtual Meeting" } 
+                },
+                // 8. Notes
+                "Notes": { 
+                    rich_text: [{ text: { content: taskData.notes || "" } }] 
+                },
+                // 9. NEW FIELD: Focus This Week (Checkbox)
+                "Focus This Week": {
+                    checkbox: taskData.focus_this_week === "Yes" 
+                }
+            };
+
+            // 10. NEW FIELDS: Dates (Only add if they exist to prevent errors)
+            if (taskData.start_date) {
+                notionProperties["Start Date"] = { date: { start: taskData.start_date } };
+            }
+            if (taskData.due_date) {
+                notionProperties["Due Date"] = { date: { start: taskData.due_date } };
+            }
+
+            // --- EXECUTE CREATE OR UPDATE ---
+
             if (taskData.action === 'CREATE') {
                 // Perform Notion CREATE
                 console.log(`[Slack Action] Creating new task in Notion DB: ${dbId}`);
                 await notion.pages.create({
                     parent: { database_id: dbId },
-                    properties: {
-                        // 1. Tasks (Title property renamed to 'Tasks' in Notion)
-                        "Tasks": { 
-                            title: [{ text: { content: taskData.title } }] 
-                        },
-                        
-                        // 2. Status
-                        "Status": { 
-                            status: { name: taskData.status || "To do" } 
-                        },
-                        
-                        // 3. REMOVED PROJECT (Option B)
-                        
-                        // 4. Jobs (Mapped from Linked JTBD, now Text)
-                        "Jobs": { 
-                            rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
-                        },
-
-                        // 5. Owner (Now Text)
-                        "Owner": { 
-                            rich_text: [{ text: { content: taskData.owner || "" } }] 
-                        },
-
-                        // 6. Priority Level
-                        "Priority Level": { 
-                            select: { name: taskData.priority || "Medium" } 
-                        },
-
-                        // 7. Source
-                        "Source": { 
-                            select: { name: "Virtual Meeting" } 
-                        },
-
-                        // 8. Notes
-                        "Notes": { 
-                            rich_text: [{ text: { content: taskData.notes || "" } }] 
-                        }
-                    }
+                    properties: notionProperties
                 });
                 
                 // Update Slack Message to show success
                 res.status(200).json({
                     replace_original: "true",
-                    text: `✅ *Created:* ${taskData.title} in Notion.`
+                    text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
                 });
 
             } else if (taskData.action === 'UPDATE') {
@@ -616,46 +649,15 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
 
                 if (pageId) {
                     console.log(`[Slack Action] Updating Page ID: ${pageId}`);
+                    
+                    // Update notes logic (Append instead of overwrite)
+                    notionProperties["Notes"] = { 
+                        rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
+                    };
+
                     await notion.pages.update({
                         page_id: pageId,
-                        properties: {
-                            // 1. Tasks (Title)
-                            "Tasks": { 
-                                title: [{ text: { content: taskData.title } }] 
-                            },
-
-                            // 2. Status
-                            "Status": { 
-                                status: { name: taskData.status } 
-                            },
-
-                            // 3. REMOVED PROJECT (Option B)
-
-                            // 4. Jobs (JTBD)
-                            "Jobs": { 
-                                rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
-                            },
-
-                            // 5. Owner
-                            "Owner": { 
-                                rich_text: [{ text: { content: taskData.owner || "" } }] 
-                            },
-
-                            // 6. Priority Level
-                            "Priority Level": { 
-                                select: { name: taskData.priority || "Medium" } 
-                            },
-
-                            // 7. Source
-                            "Source": { 
-                                select: { name: "Virtual Meeting" } 
-                            },
-
-                            // 8. Notes
-                            "Notes": { 
-                                rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
-                            }
-                        }
+                        properties: notionProperties
                     });
 
                     res.status(200).json({
@@ -859,7 +861,11 @@ console.log(
     status: t.status,
     owner: t.owner && t.owner !== "" ? t.owner : "Unassigned",
     priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
-    linked_jtbd: t.linked_jtbd?.name || "TBD"
+    linked_jtbd: t.linked_jtbd?.name || "TBD",
+    // Pass new fields
+    start_date: t.start_date,
+    due_date: t.due_date,
+    focus_this_week: t.focus_this_week
   }))
 );
 
@@ -884,6 +890,9 @@ FIELD PRESERVATION RULE:
 - owner MUST be copied from proposal.owner
 - priority MUST be copied from proposal.priority
 - linked_jtbd MUST be copied from proposal.linked_jtbd
+- start_date MUST be copied from proposal.start_date
+- due_date MUST be copied from proposal.due_date
+- focus_this_week MUST be copied from proposal.focus_this_week
 - Do NOT invent or erase these fields
 
 
@@ -920,7 +929,10 @@ OUTPUT SCHEMA:
   "linked_jtbd": "string",
   "project": "string",
   "notes": "string",
-  "status": "string"
+  "status": "string",
+  "start_date": "string or null",
+  "due_date": "string or null",
+  "focus_this_week": "string"
 }
 `;
 
