@@ -585,7 +585,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                         },
                         
                         // 4. Linked JTBD
-                        "Linked JTBD": { 
+                        "Jobs": { 
                             rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
                         },
 
@@ -649,7 +649,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                             },
 
                             // 3. Linked JTBD (Assumed Rich Text)
-                            "Linked JTBD": { 
+                            "Jobs": { 
                                 rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
                             },
 
