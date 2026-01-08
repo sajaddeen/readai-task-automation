@@ -1,13 +1,11 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-// FIX: We no longer need the OpenAI package, only the mongoose instance and connection
 const { connectDB } = require('@read-ai/shared-config');
 const mongoose = require('mongoose');
 const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
-// Ensure these utility files exist in your project structure
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
 
@@ -15,7 +13,7 @@ const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
-const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
+const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID;
 const PORT = process.env.MCP_PORT || 3001;
 const app = express();
 
@@ -357,7 +355,7 @@ const queryNotionDB = async (extractedProjects) => {
     
     try {
         const response = await notion.dataSources.query({
-            database_id: NOTION_TASK_DB_ID,
+            data_source_id: NOTION_TASK_DB_ID,
             // Removed 'filter' so it doesn't crash on missing 'Project' column
             // We only ask for 'Tasks' and 'Status' properties
             properties: ['Tasks', 'Status'], 
@@ -560,88 +558,57 @@ app.get('/api/v1/list-notion-databases', async (req, res) => {
 
 // --- MCP SERVER API ENDPOINTS ---
 
-// --- REPLACED: NEW INTERACTIVE SLACK ENDPOINT ---
+// --- REPLACED: NEW INTERACTIVE SLACK ENDPOINT (FIXED PARENT TYPE) ---
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
-        // Slack sends the payload as a stringified JSON inside 'payload' body param
         const payload = JSON.parse(req.body.payload);
         const action = payload.actions[0];
         
-        // IMPORTANT: Slack expects a 200 OK immediately, or it shows an error to user.
-        // We will do the work, then send a response URL update if needed, but for now lets just await the work.
+        // IMPORTANT: Slack expects a 200 OK immediately.
         
         if (action.action_id === 'accept_task') {
-            const taskData = JSON.parse(action.value); // Recover the full data we hid in the button
-            const dbId = taskData.targetDbId || NOTION_TASK_DB_ID;
+            const taskData = JSON.parse(action.value);
+            // We treat the "DB ID" as a "Data Source ID" now
+            const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
             // Helper: Build the Properties Object
             const notionProperties = {
-                // 1. Tasks (Title property renamed to 'Tasks' in Notion)
-                "Tasks": { 
-                    title: [{ text: { content: taskData.title } }] 
-                },
-                // 2. Status
-                "Status": { 
-                    status: { name: taskData.status || "To do" } 
-                },
-                // 3. REMOVED PROJECT (Option B) - Column not used
-
-                // 4. Jobs (Mapped from Linked JTBD, now Text)
-                "Jobs": { 
-                    rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] 
-                },
-                // 5. Owner (Now Text)
-                "Owner": { 
-                    rich_text: [{ text: { content: taskData.owner || "" } }] 
-                },
-                // 6. Priority Level
-                "Priority Level": { 
-                    select: { name: taskData.priority || "Medium" } 
-                },
-                // 7. Source
-                "Source": { 
-                    select: { name: "Virtual Meeting" } 
-                },
-                // 8. Notes
-                "Notes": { 
-                    rich_text: [{ text: { content: taskData.notes || "" } }] 
-                },
-                // 9. NEW FIELD: Focus This Week (Checkbox)
-                "Focus This Week": {
-                    checkbox: taskData.focus_this_week === "Yes" 
-                }
+                "Tasks": { title: [{ text: { content: taskData.title } }] },
+                "Status": { status: { name: taskData.status || "To do" } },
+                "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
+                "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
+                "Priority Level": { select: { name: taskData.priority || "Medium" } },
+                "Source": { select: { name: "Virtual Meeting" } },
+                "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
+                "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
             };
 
-            // 10. NEW FIELDS: Dates (Only add if they exist to prevent errors)
-            if (taskData.start_date) {
-                notionProperties["Start Date"] = { date: { start: taskData.start_date } };
-            }
-            if (taskData.due_date) {
-                notionProperties["Due Date"] = { date: { start: taskData.due_date } };
-            }
+            // Conditional Dates
+            if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
+            if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
 
             // --- EXECUTE CREATE OR UPDATE ---
 
             if (taskData.action === 'CREATE') {
-                // Perform Notion CREATE
-                console.log(`[Slack Action] Creating new task in Notion DB: ${dbId}`);
+                console.log(`[Slack Action] Creating new task in Source ID: ${sourceId}`);
+                
+                // --- FIX APPLIED HERE ---
                 await notion.pages.create({
-                    parent: { database_id: dbId },
+                    parent: { 
+                        type: "data_source_id", 
+                        data_source_id: sourceId 
+                    },
                     properties: notionProperties
                 });
+                // ------------------------
                 
-                // Update Slack Message to show success
                 res.status(200).json({
                     replace_original: "true",
                     text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
                 });
 
             } else if (taskData.action === 'UPDATE') {
-                // Perform Notion UPDATE
-                
-                // Helper to extract ID from URL if not passed explicitly. 
                 let pageId = taskData.id; 
-                
                 if (!pageId && taskData.notion_url) {
                     const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
                     if(matches) pageId = matches[0];
@@ -649,8 +616,6 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
 
                 if (pageId) {
                     console.log(`[Slack Action] Updating Page ID: ${pageId}`);
-                    
-                    // Update notes logic (Append instead of overwrite)
                     notionProperties["Notes"] = { 
                         rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
                     };
@@ -670,16 +635,14 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             }
 
         } else if (action.action_id === 'skip_task') {
-            // Handle Skip
              res.status(200).json({
                 replace_original: "true",
                 text: `⏭️ *Skipped:* Task ignored.`
             });
 
         } else if (action.action_id === 'feedback_task') {
-            // Handle Feedback (Placeholder)
             res.status(200).json({
-                replace_original: "false", // Don't delete the buttons yet
+                replace_original: "false",
                 text: `📝 Feedback noted. (Modal logic to be implemented)`
             });
         } else {
@@ -691,7 +654,6 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         res.status(500).send("Error processing interaction");
     }
 });
-
 
 app.post('/api/v1/slack-approved-tasks', async (req, res) => {
     // This was your old endpoint for bulk approval, leaving it as requested.
