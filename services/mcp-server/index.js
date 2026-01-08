@@ -992,12 +992,38 @@ finalOutput.push(parsed);
 });
 
 
+// --- DEBUG FUNCTION: PASTE THIS RIGHT ABOVE startServer ---
+const debugNotionAccess = async () => {
+    try {
+        console.log("🔍 Checking Notion Access...");
+        const response = await notion.search({
+            filter: { property: 'object', value: 'database' }
+        });
+        
+        console.log("\n--- 📋 DATABASES YOUR BOT CAN SEE ---");
+        if (response.results.length === 0) {
+            console.log("❌ NONE! You must go to the database in Notion, click '...', and add your connection.");
+        } else {
+            response.results.forEach(db => {
+                const title = db.title[0]?.plain_text || "Untitled";
+                console.log(`✅ Name: "${title}" | ID: ${db.id}`);
+            });
+        }
+        console.log("---------------------------------------\n");
+    } catch (error) {
+        console.error("❌ Notion Connection Error:", error.message);
+    }
+};
+
 // Start the server
 const startServer = async () => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
         console.warn("\n NOTION KEYS MISSING: Notion integration will be mocked.");
     }
     
+    // CALL THE DEBUG FUNCTION HERE
+    await debugNotionAccess(); 
+
     await connectDB();
     app.listen(PORT, () => {
         console.log(`🧠 MCP Server running on port ${PORT}`);
