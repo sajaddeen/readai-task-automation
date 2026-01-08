@@ -992,19 +992,24 @@ finalOutput.push(parsed);
 });
 
 
-// --- DEBUG FUNCTION: PASTE THIS RIGHT ABOVE startServer ---
+// --- DEBUG FUNCTION: CORRECTED ---
 const debugNotionAccess = async () => {
     try {
         console.log("🔍 Checking Notion Access...");
-        const response = await notion.search({
-            filter: { property: 'object', value: 'database' }
-        });
+        
+        // FIX: Removed the 'filter' parameter completely to avoid the validation error.
+        // We will fetch everything and filter for databases manually below.
+        const response = await notion.search({}); 
+        
+        // Manually filter the results to find only Databases
+        const databases = response.results.filter(item => item.object === 'database');
         
         console.log("\n--- 📋 DATABASES YOUR BOT CAN SEE ---");
-        if (response.results.length === 0) {
-            console.log("❌ NONE! You must go to the database in Notion, click '...', and add your connection.");
+        if (databases.length === 0) {
+            console.log("❌ NONE! The bot is connected, but it cannot see any databases.");
+            console.log("👉 ACTION: Go to your Notion Database -> Click '...' -> Connections -> Add your Bot.");
         } else {
-            response.results.forEach(db => {
+            databases.forEach(db => {
                 const title = db.title[0]?.plain_text || "Untitled";
                 console.log(`✅ Name: "${title}" | ID: ${db.id}`);
             });
