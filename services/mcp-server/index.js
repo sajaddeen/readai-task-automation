@@ -129,7 +129,7 @@ ${task.notes}`;
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
-                    value: "feedback"
+                    value: buttonPayload
                 }
             ]
         });
@@ -558,100 +558,186 @@ app.get('/api/v1/list-notion-databases', async (req, res) => {
 
 // --- MCP SERVER API ENDPOINTS ---
 
-// --- REPLACED: NEW INTERACTIVE SLACK ENDPOINT (FIXED PARENT TYPE) ---
+// --- UPDATED: SLACK INTERACTION HANDLER (Accept, Skip, & Feedback Modal) ---
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
         const payload = JSON.parse(req.body.payload);
-        const action = payload.actions[0];
-        
-        // IMPORTANT: Slack expects a 200 OK immediately.
-        
-        if (action.action_id === 'accept_task') {
-            const taskData = JSON.parse(action.value);
-            // We treat the "DB ID" as a "Data Source ID" now
-            const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
-            // Helper: Build the Properties Object
-            const notionProperties = {
-                "Tasks": { title: [{ text: { content: taskData.title } }] },
-                "Status": { status: { name: taskData.status || "To do" } },
-                "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
-                "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
-                "Priority Level": { select: { name: taskData.priority || "Medium" } },
-                "Source": { select: { name: "Virtual Meeting" } },
-                "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
-                "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
-            };
-
-            // Conditional Dates
-            if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
-            if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
-
-            // --- EXECUTE CREATE OR UPDATE ---
-
-            if (taskData.action === 'CREATE') {
-                console.log(`[Slack Action] Creating new task in Source ID: ${sourceId}`);
+        // ---------------------------------------------------------
+        // CASE 1: BUTTON CLICKS (Block Actions)
+        // ---------------------------------------------------------
+        if (payload.type === 'block_actions') {
+            const action = payload.actions[0];
+            
+            if (action.action_id === 'feedback_task') {
                 
-                // --- FIX APPLIED HERE ---
-                await notion.pages.create({
-                    parent: { 
-                        type: "data_source_id", 
-                        data_source_id: sourceId 
-                    },
-                    properties: notionProperties
-                });
-                // ------------------------
-                
-                res.status(200).json({
-                    replace_original: "true",
-                    text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
-                });
-
-            } else if (taskData.action === 'UPDATE') {
-                let pageId = taskData.id; 
-                if (!pageId && taskData.notion_url) {
-                    const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
-                    if(matches) pageId = matches[0];
-                }
-
-                if (pageId) {
-                    console.log(`[Slack Action] Updating Page ID: ${pageId}`);
-                    notionProperties["Notes"] = { 
-                        rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
-                    };
-
-                    await notion.pages.update({
-                        page_id: pageId,
-                        properties: notionProperties
-                    });
-
-                    res.status(200).json({
-                        replace_original: "true",
-                        text: `✅ *Updated:* ${taskData.title} in Notion.`
-                    });
-                } else {
-                     res.status(400).send("Could not determine Page ID for update.");
-                }
+            } else {
+                 
             }
 
-        } else if (action.action_id === 'skip_task') {
-             res.status(200).json({
-                replace_original: "true",
-                text: `⏭️ *Skipped:* Task ignored.`
-            });
+            // --- 1. HANDLE "ACCEPT" (Direct Create/Update) ---
+            if (action.action_id === 'accept_task') {
+                const taskData = JSON.parse(action.value);
+                const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
-        } else if (action.action_id === 'feedback_task') {
-            res.status(200).json({
-                replace_original: "false",
-                text: `📝 Feedback noted. (Modal logic to be implemented)`
-            });
-        } else {
-            res.status(200).send();
+                const notionProperties = {
+                    "Tasks": { title: [{ text: { content: taskData.title } }] },
+                    "Status": { status: { name: taskData.status || "To do" } },
+                    "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
+                    "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
+                    "Priority Level": { select: { name: taskData.priority || "Medium" } },
+                    "Source": { select: { name: "Virtual Meeting" } },
+                    "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
+                    "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
+                };
+
+                if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
+                if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
+
+                if (taskData.action === 'CREATE') {
+                    console.log(`[Slack] Creating task: ${taskData.title}`);
+                    await notion.pages.create({
+                        parent: { type: "data_source_id", data_source_id: sourceId },
+                        properties: notionProperties
+                    });
+                    
+                    return res.status(200).json({
+                        replace_original: "true",
+                        text: `✅ *Created:* ${taskData.title} \n_Focus: ${taskData.focus_this_week}_`
+                    });
+
+                } else if (taskData.action === 'UPDATE') {
+                    let pageId = taskData.id; 
+                    if (!pageId && taskData.notion_url) {
+                        const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
+                        if(matches) pageId = matches[0];
+                    }
+
+                    if (pageId) {
+                        notionProperties["Notes"] = { 
+                            rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
+                        };
+                        await notion.pages.update({ page_id: pageId, properties: notionProperties });
+                        
+                        return res.status(200).json({
+                            replace_original: "true",
+                            text: `✅ *Updated:* ${taskData.title}`
+                        });
+                    }
+                }
+            } 
+            
+            // --- 2. HANDLE "SKIP" ---
+            else if (action.action_id === 'skip_task') {
+                return res.status(200).json({
+                    replace_original: "true",
+                    text: `⏭️ *Skipped*`
+                });
+            }
+
+            // --- 3. HANDLE "FEEDBACK" (Open Modal) ---
+            else if (action.action_id === 'feedback_task') {
+                let taskData = {};
+                try {
+                     taskData = JSON.parse(action.value);
+                } catch(e) {
+                    console.log("Feedback button did not have JSON payload. Opening empty modal.");
+                }
+
+                // Call Slack API to open a modal
+                await slackClient.views.open({
+                    trigger_id: payload.trigger_id,
+                    view: {
+                        type: "modal",
+                        callback_id: "feedback_submission",
+                        private_metadata: JSON.stringify({
+                            targetDbId: taskData.targetDbId || NOTION_TASK_DB_ID,
+                            action: taskData.action || 'CREATE',
+                            id: taskData.id || null, // For updates
+                            notion_url: taskData.notion_url || null
+                        }),
+                        title: { type: "plain_text", text: "Edit Task Details" },
+                        submit: { type: "plain_text", text: "Save to Notion" },
+                        close: { type: "plain_text", text: "Cancel" },
+                        blocks: [
+                            {
+                                type: "input",
+                                block_id: "title_block",
+                                element: {
+                                    type: "plain_text_input",
+                                    action_id: "title_input",
+                                    initial_value: taskData.title || ""
+                                },
+                                label: { type: "plain_text", text: "Task Title" }
+                            },
+                            {
+                                type: "input",
+                                block_id: "notes_block",
+                                element: {
+                                    type: "plain_text_input",
+                                    action_id: "notes_input",
+                                    multiline: true,
+                                    initial_value: taskData.notes || ""
+                                },
+                                label: { type: "plain_text", text: "Notes / Context" }
+                            },
+                             {
+                                type: "input",
+                                block_id: "owner_block",
+                                optional: true,
+                                element: {
+                                    type: "plain_text_input",
+                                    action_id: "owner_input",
+                                    initial_value: taskData.owner || ""
+                                },
+                                label: { type: "plain_text", text: "Owner" }
+                            }
+                        ]
+                    }
+                });
+                
+                return res.status(200).send();
+            }
+        }
+
+        // ---------------------------------------------------------
+        // CASE 2: MODAL SUBMISSION (View Submission)
+        // ---------------------------------------------------------
+        if (payload.type === 'view_submission') {
+            const view = payload.view;
+            const values = view.state.values;
+            const metadata = JSON.parse(view.private_metadata);
+            const sourceId = metadata.targetDbId;
+            const newTitle = values.title_block.title_input.value;
+            const newNotes = values.notes_block.notes_input.value;
+            const newOwner = values.owner_block.owner_input.value;
+
+            console.log(`[Slack Modal] Submitting edited task: ${newTitle}`);
+
+            const notionProperties = {
+                "Tasks": { title: [{ text: { content: newTitle } }] },
+                "Notes": { rich_text: [{ text: { content: newNotes } }] },
+                "Owner": { rich_text: [{ text: { content: newOwner } }] },
+            };
+
+            if (metadata.action === 'CREATE') {
+                await notion.pages.create({
+                    parent: { type: "data_source_id", data_source_id: sourceId },
+                    properties: notionProperties
+                });
+            } else if (metadata.action === 'UPDATE' && metadata.id) {
+                 await notion.pages.update({
+                    page_id: metadata.id,
+                    properties: notionProperties
+                });
+            }
+
+            return res.status(200).json({ response_action: "clear" });
         }
 
     } catch (error) {
         console.error("Slack Interaction Error:", error.message);
-        res.status(500).send("Error processing interaction");
+        res.status(500).send("Error");
     }
 });
 
