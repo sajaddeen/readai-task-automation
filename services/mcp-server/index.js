@@ -569,10 +569,13 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         if (payload.type === 'block_actions') {
             const action = payload.actions[0];
             
+            // Acknowledge immediately (Slack requirement)
             if (action.action_id === 'feedback_task') {
-                
+                // For modals, we MUST open the view within 3 seconds, so we don't send a res.json() yet
+                // We just proceed to open the modal.
             } else {
-                 
+                 // For Accept/Skip, we return a 200 OK immediately and update the message later
+                 // But strictly speaking, we can just await the logic and send JSON to update the message.
             }
 
             // --- 1. HANDLE "ACCEPT" (Direct Create/Update) ---
@@ -580,6 +583,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 const taskData = JSON.parse(action.value);
                 const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
+                // Construct Notion Properties
                 const notionProperties = {
                     "Tasks": { title: [{ text: { content: taskData.title } }] },
                     "Status": { status: { name: taskData.status || "To do" } },
@@ -591,6 +595,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
                 };
 
+                // Add Dates if present
                 if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
                 if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
 
@@ -607,6 +612,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     });
 
                 } else if (taskData.action === 'UPDATE') {
+                    // (Same update logic as before...)
                     let pageId = taskData.id; 
                     if (!pageId && taskData.notion_url) {
                         const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
@@ -637,6 +643,19 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
 
             // --- 3. HANDLE "FEEDBACK" (Open Modal) ---
             else if (action.action_id === 'feedback_task') {
+                // We need to send a 200 OK *first* to acknowledge the button click, 
+                // OR we can just allow the function to run. 
+                // Best practice for modals: Send 200 OK immediately if using response_url, 
+                // but for 'views.open' we just call the API.
+                
+                // We recover the data hidden in the "feedback" button value (if you stored it there)
+                // OR simpler: The feedback button usually just has "feedback" as value. 
+                // NOTE: To pre-fill the modal, we need the task data. 
+                // *Fix:* Let's assume you updated sendTaskListToSlack to pass the FULL JSON in the feedback button too.
+                // If not, we can't pre-fill. 
+                
+                // Let's assume the button value holds the JSON just like the 'accept' button.
+                // You might need to update sendTaskListToSlack to ensure the feedback button has `value: buttonPayload` instead of "feedback".
                 let taskData = {};
                 try {
                      taskData = JSON.parse(action.value);
@@ -650,6 +669,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     view: {
                         type: "modal",
                         callback_id: "feedback_submission",
+                        // Pass hidden data (DB ID, Action Type, Notion ID) in private_metadata
                         private_metadata: JSON.stringify({
                             targetDbId: taskData.targetDbId || NOTION_TASK_DB_ID,
                             action: taskData.action || 'CREATE',
@@ -696,6 +716,8 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     }
                 });
                 
+                // We don't return JSON here because opening a modal is a separate API call. 
+                // We just send 200 OK to say "we got the click".
                 return res.status(200).send();
             }
         }
@@ -706,20 +728,28 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         if (payload.type === 'view_submission') {
             const view = payload.view;
             const values = view.state.values;
+            
+            // Extract metadata we hid in the modal
             const metadata = JSON.parse(view.private_metadata);
             const sourceId = metadata.targetDbId;
+
+            // Extract User Edits
             const newTitle = values.title_block.title_input.value;
             const newNotes = values.notes_block.notes_input.value;
             const newOwner = values.owner_block.owner_input.value;
 
             console.log(`[Slack Modal] Submitting edited task: ${newTitle}`);
 
+            // Construct Notion Properties (Merging edits)
             const notionProperties = {
                 "Tasks": { title: [{ text: { content: newTitle } }] },
                 "Notes": { rich_text: [{ text: { content: newNotes } }] },
                 "Owner": { rich_text: [{ text: { content: newOwner } }] },
+                // We keep defaults for fields not in the form (Status, Priority, etc.)
+                // Or you can add inputs for them if you want.
             };
 
+            // WRITE TO NOTION
             if (metadata.action === 'CREATE') {
                 await notion.pages.create({
                     parent: { type: "data_source_id", data_source_id: sourceId },
@@ -732,6 +762,8 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 });
             }
 
+            // Return empty 200 OK to close the modal
+            // (Slack requires this to be instant)
             return res.status(200).json({ response_action: "clear" });
         }
 
@@ -1040,42 +1072,12 @@ finalOutput.push(parsed);
 });
 
 
-// --- DEBUG FUNCTION: CORRECTED ---
-const debugNotionAccess = async () => {
-    try {
-        console.log("🔍 Checking Notion Access...");
-        
-        // FIX: Removed the 'filter' parameter completely to avoid the validation error.
-        // We will fetch everything and filter for databases manually below.
-        const response = await notion.search({}); 
-        
-        // Manually filter the results to find only Databases
-        const databases = response.results.filter(item => item.object === 'database');
-        
-        console.log("\n--- 📋 DATABASES YOUR BOT CAN SEE ---");
-        if (databases.length === 0) {
-            console.log("❌ NONE! The bot is connected, but it cannot see any databases.");
-            console.log("👉 ACTION: Go to your Notion Database -> Click '...' -> Connections -> Add your Bot.");
-        } else {
-            databases.forEach(db => {
-                const title = db.title[0]?.plain_text || "Untitled";
-                console.log(`✅ Name: "${title}" | ID: ${db.id}`);
-            });
-        }
-        console.log("---------------------------------------\n");
-    } catch (error) {
-        console.error("❌ Notion Connection Error:", error.message);
-    }
-};
-
 // Start the server
 const startServer = async () => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
         console.warn("\n NOTION KEYS MISSING: Notion integration will be mocked.");
     }
     
-    // CALL THE DEBUG FUNCTION HERE
-    await debugNotionAccess(); 
 
     await connectDB();
     app.listen(PORT, () => {
