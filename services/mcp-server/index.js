@@ -520,7 +520,14 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     await notion.pages.create({ parent: { type: "data_source_id", data_source_id: sourceId }, properties: notionProperties });
                     
                     // UPDATE MESSAGE TO SUCCESS
-                    res.status(200).json({ replace_original: "true", text: `✅ *Successfully Created:* ${taskData.title}` });
+                    res.status(200).json({ replace_original: "true", // <--- This tells Slack "Overwrite the previous message"
+        blocks: [
+            {
+                type: "section",
+                // It dynamically inserts the specific task title here 👇
+                text: { type: "mrkdwn", text: `✅ *Successfully Created* \n${taskData.title}` } 
+            }
+        ] });
 
                 } else if (taskData.action === 'UPDATE') {
                     let pageId = taskData.id; 
@@ -534,7 +541,14 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                         await notion.pages.update({ page_id: pageId, properties: notionProperties });
                         
                         // UPDATE MESSAGE TO SUCCESS
-                        res.status(200).json({ replace_original: "true", text: `✅ *Successfully Updated:* ${taskData.title}` });
+                        res.status(200).json({ replace_original: "true",
+        blocks: [
+            {
+                type: "section",
+                // Updates get a different message 👇
+                text: { type: "mrkdwn", text: `✅ *Successfully Updated* \n${taskData.title}` }
+            }
+        ] });
                     }
                 }
 
