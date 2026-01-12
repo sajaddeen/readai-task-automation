@@ -7,8 +7,7 @@ const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
 
-// --- CUSTOM UTILITIES ---
-// Ensure these utility files exist in your project structure
+
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
 const logger = require('../utilities/logger'); // <--- LOGGER INTEGRATED

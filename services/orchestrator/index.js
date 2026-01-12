@@ -6,7 +6,7 @@ const multer = require('multer');
 const mammoth = require('mammoth');
 const crypto = require('crypto');
 
-const logger = require('./utilities/logger'); 
+const logger = require('../utilities/logger');
 
 const PORT = process.env.ORCHESTRATOR_PORT || 3000;
 const MCP_SERVER_URL = process.env.MCP_SERVER_URL;
