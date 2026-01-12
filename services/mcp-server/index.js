@@ -129,7 +129,7 @@ ${task.notes}`;
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
-                    value: "feedback"
+                    value: buttonPayload
                 }
             ]
         });
