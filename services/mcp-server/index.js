@@ -6,35 +6,39 @@ const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
+
+// --- CUSTOM UTILITIES ---
+// Ensure these utility files exist in your project structure
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
+const logger = require('../utilities/logger'); // <--- LOGGER INTEGRATED
 
+// --- CONFIGURATION ---
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
-const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID;
+const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
 const PORT = process.env.MCP_PORT || 3001;
 const app = express();
 
-console.log(`[Config Check] OpenAI API Key is loaded: ${!!process.env.OPENAI_API_KEY}`); 
+logger.info(`[Config Check] OpenAI API Key is loaded: ${!!process.env.OPENAI_API_KEY}`); 
 
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ limit: '50mb', extended: true })); 
 
 
-// --- FEEDBACK LOOP SESSION STORE (In-Memory) ---
+// ==========================================================================
+//  GLOBAL STATE: FEEDBACK SESSIONS
+// ==========================================================================
 // Stores task data while the user is editing it in the modal loop
+// Key: sessionId (UUID) | Value: { task, iteration, aiSuggestion, traceId }
 const feedbackSessions = new Map();
-/*
-sessionId => {
-  task,
-  iteration,
-  aiSuggestion
-}
-*/
 
-// --- NEW: FEEDBACK MODAL BUILDER (All Fields) ---
+
+// ==========================================================================
+//  HELPER: OPEN FEEDBACK MODAL (ALL FIELDS)
+// ==========================================================================
 const openFeedbackModal = async (triggerId, task, sessionId) => {
     await slackClient.views.open({
       trigger_id: triggerId,
@@ -46,7 +50,7 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
         submit: { type: "plain_text", text: "Submit Feedback" },
         close: { type: "plain_text", text: "Cancel" },
         blocks: [
-          // 1. TITLE
+          // --- TITLE ---
           {
             type: "input",
             block_id: "title_block",
@@ -57,7 +61,7 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
               initial_value: task.title
             }
           },
-          // 2. NOTES
+          // --- NOTES ---
           {
             type: "input",
             block_id: "notes_block",
@@ -69,11 +73,10 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
               initial_value: task.notes
             }
           },
-          // 3. ROW: OWNER & PROJECT
-          {
-            type: "section",
-            text: { type: "mrkdwn", text: "*Task Details*" }
-          },
+          { type: "divider" },
+          { type: "section", text: { type: "mrkdwn", text: "*Task Details*" } },
+          
+          // --- OWNER & PROJECT ---
           {
             type: "input",
             block_id: "owner_block",
@@ -94,7 +97,8 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
               initial_value: task.project || "General"
             }
           },
-          // 4. PRIORITY & STATUS (Selects)
+
+          // --- PRIORITY ---
           {
             type: "input",
             block_id: "priority_block",
@@ -113,6 +117,8 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
                 ]
             }
           },
+
+          // --- STATUS ---
           {
             type: "input",
             block_id: "status_block",
@@ -131,7 +137,8 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
                 ]
             }
           },
-          // 5. DATES
+
+          // --- DATES ---
           {
              type: "input",
              block_id: "start_date_block",
@@ -156,7 +163,8 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
                  placeholder: { type: "plain_text", text: "Select a date" }
              }
           },
-          // 6. FOCUS & JTBD
+
+          // --- FOCUS & JTBD ---
           {
             type: "input",
             block_id: "focus_block",
@@ -191,11 +199,13 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
 };
 
 
-// --- SLACK MESSAGING HELPER ---
+// ==========================================================================
+//  HELPER: SLACK MESSAGING (With Logger + Trace ID)
+// ==========================================================================
 
-const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
+const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId, traceId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
-        console.warn("\n⚠️ SLACK CONFIG MISSING: Skipping Slack notification.");
+        logger.warn("SLACK CONFIG MISSING: Skipping Slack notification.", { traceId });
         return;
     }
 
@@ -204,24 +214,29 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     // --- MAIN HEADER ---
     blocks.push({
         type: "header",
-        text: {
-            type: "plain_text",
-            text: `📝 Sync Report: ${meetingTitle}`,
-            emoji: true
-        }
+        text: { type: "plain_text", text: `📝 Sync Report: ${meetingTitle}`, emoji: true }
+    });
+    
+    // Trace ID Context (Small footer)
+    blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `_Ref: ${traceId || 'N/A'}_` }]
     });
 
     blocks.push({ type: "divider" });
 
-    // --- GENERATE VERTICAL LIST BLOCKS ---
+    // --- GENERATE PROPOSAL CARDS ---
     
+    // We iterate through ALL tasks to maintain the "X of Y" count
     taskList.forEach((task, index) => {
         const proposalCount = `${index + 1} of ${taskList.length}`;
         
-        // Prepare Button Payload (Includes all fields so feedback loop works)
+        // Prepare Button Payload 
+        // We persist targetDbId and traceId so the next action knows the context
         const buttonPayload = JSON.stringify({
             ...task,
             targetDbId: targetDbId || NOTION_TASK_DB_ID,
+            traceId: traceId, 
             notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
         });
 
@@ -259,6 +274,7 @@ ${existingTaskLine}
 *Notes:*
 ${task.notes}`;
 
+        // 1. Add the text block
         blocks.push({
             type: "section",
             text: { type: "mrkdwn", text: detailsText }
@@ -308,16 +324,18 @@ ${task.notes}`;
             text: `Sync Report: ${meetingTitle}`,
             blocks: blocks
         });
-        console.log(`✅ Detailed task report sent to Slack (${taskList.length} proposals).`);
+        logger.info(`Detailed task report sent to Slack (${taskList.length} proposals).`, { traceId });
     } catch (error) {
-        console.error("❌ Failed to send Slack message:", error.message);
+        logger.error("Failed to send Slack message", error, { traceId });
     }
 };
 
 
-// --- AI AGENT 1: TRANSCRIPT NORMALIZATION (LIVE) ---
+// ==========================================================================
+//  HELPER: TRANSCRIPT NORMALIZATION (With Trace ID)
+// ==========================================================================
 
-const normalizeTranscript = async (transcript, initialData) => {
+const normalizeTranscript = async (transcript, initialData, traceId) => {
     
     const apiKey = process.env.OPENAI_API_KEY;
 
@@ -327,7 +345,7 @@ const normalizeTranscript = async (transcript, initialData) => {
     
     // Schema definition
    const jsonFormatSchema = {
-  "transcript_id": crypto.randomBytes(16).toString("hex"),
+  "transcript_id": traceId || "generated_id", // FORCE TRACE ID
   "source": initialData.source,
   "source_id": initialData.source_id,
   "meeting_title": initialData.meeting_title,
@@ -379,37 +397,38 @@ const normalizeTranscript = async (transcript, initialData) => {
   }
 };
 
+    const prompt = `
+    You are an expert task-extraction AI working for Prouvé projects.
+    Analyze the transcript and extract structured tasks.
     
-const prompt = `
-You are an expert task-extraction AI working for Prouvé projects.
-Analyze the transcript and extract structured tasks.
+    CRITICAL: Use "${traceId}" as the transcript_id in the output.
 
-CRITICAL RULES:
-- Every task must belong to EXACTLY ONE project (Island Way or Ridge Oak).
-- If unsure of project → choose the MOST LIKELY one.
+    CRITICAL RULES:
+    - Every task must belong to EXACTLY ONE project (Island Way or Ridge Oak).
+    - If unsure of project → choose the MOST LIKELY one.
 
-CRITICAL NEW RULES (DATES & FOCUS):
-1. **Dates**: Extract 'start_date' and 'due_date' (YYYY-MM-DD). If unknown, use null.
-2. **Focus This Week**: "Yes" ONLY if urgent/"this week". Otherwise "No".
+    CRITICAL NEW RULES (DATES & FOCUS):
+    1. **Dates**: Extract 'start_date' and 'due_date' (YYYY-MM-DD). If unknown, use null.
+    2. **Focus This Week**: "Yes" ONLY if urgent/"this week". Otherwise "No".
 
-TASK QUALITY:
-- Task titles must be concise.
-- Notes must be 2–4 sentences explaining context and next steps.
+    TASK QUALITY:
+    - Task titles must be concise.
+    - Notes must be 2–4 sentences explaining context and next steps.
 
-JTBD LINKING:
-- Always try to link JTBD. If unknown: { "name": "TBD", "url": "TBD" }
+    JTBD LINKING:
+    - Always try to link JTBD. If unknown: { "name": "TBD", "url": "TBD" }
 
-Output MUST be valid JSON matching the schema.
+    Output MUST be valid JSON matching the schema.
 
-Transcript:
-${transcript}
+    Transcript:
+    ${transcript}
 
-Output JSON Schema:
-${JSON.stringify(jsonFormatSchema)}
-`;
+    Output JSON Schema:
+    ${JSON.stringify(jsonFormatSchema)}
+    `;
 
     try {
-        console.log("--- RAW TRANSCRIPT SENT TO AI ---");
+        logger.info('Sending request to OpenAI for normalization...', { traceId });
         
         const fetchResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
@@ -436,26 +455,25 @@ ${JSON.stringify(jsonFormatSchema)}
         
         const normalizedJson = JSON.parse(completion.choices[0].message.content);
         
-        normalizedJson.transcript_id = jsonFormatSchema.transcript_id;
-        normalizedJson.created_at = jsonFormatSchema.created_at;
-        normalizedJson.start_time = jsonFormatSchema.start_time;
-
+        normalizedJson.transcript_id = traceId;
         return normalizedJson;
 
     } catch (error) {
-        console.error("OpenAI Normalization Error:", error.message);
-        throw new Error(`Failed to normalize transcript with AI Agent. Error: ${error.message}`);
+        logger.error("OpenAI Normalization Error", error, { traceId });
+        throw error;
     }
 };
 
-// --- STEP 3: NOTION QUERY HANDLER ---
+// ==========================================================================
+//  HELPER: QUERY NOTION DB (Legacy Support)
+// ==========================================================================
 
 const queryNotionDB = async (extractedProjects) => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
         return { existing_tasks: [] };
     }
     
-    console.log(`\n[Notion] Querying database...`);
+    logger.info(`Querying Notion database...`);
     
     try {
         const response = await notion.dataSources.query({
@@ -471,16 +489,18 @@ const queryNotionDB = async (extractedProjects) => {
             action: 'UPDATE', 
         }));
 
-        console.log(`  -> Found ${existingTasks.length} existing task(s) in Notion.`);
+        logger.info(`Found ${existingTasks.length} existing task(s) in Notion.`);
         return { existing_tasks: existingTasks };
 
     } catch (error) {
-        console.error('NOTION DB QUERY ERROR:', error.message);
+        logger.error('NOTION DB QUERY ERROR', error);
         return { existing_tasks: [] };
     }
 };
 
-// --- AI AGENT 2 (STEP 4): TASK GENERATION/COMPARISON ---
+// ==========================================================================
+//  HELPER: GENERATE TASK LIST (Legacy Support)
+// ==========================================================================
 
 const generateTaskList = async (normalizedData, notionContext) => {
     
@@ -549,11 +569,13 @@ const generateTaskList = async (normalizedData, notionContext) => {
 };
 
 
-// --- NOTION: LIST ALL DATABASES ---
+// ==========================================================================
+//  HELPER: LIST NOTION DATABASES
+// ==========================================================================
 
 const listAllNotionDatabases = async () => {
     try {
-        console.log("\n[Notion] Listing all databases via Search API...");
+        logger.info("Listing all databases via Search API...");
         let allDBs = [];
         let cursor = undefined;
         do {
@@ -574,10 +596,11 @@ const listAllNotionDatabases = async () => {
             }
             cursor = response.has_more ? response.next_cursor : undefined;
         } while (cursor);
-        console.log(`[Notion] Found ${allDBs.length} databases:`, allDBs);
+        
+        logger.info(`Found ${allDBs.length} databases.`);
         return allDBs;
     } catch (error) {
-        console.error("[Notion] Failed to list databases:", error.message);
+        logger.error("Failed to list databases", error);
         throw error;
     }
 };
@@ -597,6 +620,7 @@ const fetchAllRowsInDataSource = async (data_source_id) => {
   return allPages;
 };
 
+// --- LEGACY ENDPOINT: GET ROWS ---
 app.get('/api/v1/notion-data-source-rows', async (req, res) => {
   try {
     const { db_id } = req.query;
@@ -604,21 +628,26 @@ app.get('/api/v1/notion-data-source-rows', async (req, res) => {
     const pages = await fetchAllRowsInDataSource(db_id);
     res.status(200).send({ count: pages.length, pages: pages.map(simplifyAnyPage) });
   } catch (error) {
+    logger.error("Error fetching rows", error);
     res.status(500).send({ error: error.message });
   }
 });
 
+// --- LEGACY ENDPOINT: LIST DBs ---
 app.get('/api/v1/list-notion-databases', async (req, res) => {
     try {
         const databases = await listAllNotionDatabases();
         res.status(200).send({ databases });
     } catch (error) {
+        logger.error("Error listing databases", error);
         res.status(500).send({ error: error.message });
     }
 });
 
 
-// --- UPDATED: SLACK INTERACTION HANDLER (Buttons + Modal + Chat Loop) ---
+// ==========================================================================
+//  ENDPOINT: SLACK INTERACTION (BUTTONS + MODAL + CHAT LOOP)
+// ==========================================================================
 
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
@@ -629,10 +658,11 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         // ---------------------------------------------------------
         if (payload.type === 'block_actions') {
             const action = payload.actions[0];
-            
+            const taskData = JSON.parse(action.value);
+            const traceId = taskData.traceId || "no_trace_id"; // Recover Trace ID
+
             // --- A. HANDLE "ACCEPT" (Direct Create/Update) ---
             if (action.action_id === 'accept_task') {
-                const taskData = JSON.parse(action.value);
                 const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
                 // Construct Notion Properties
@@ -651,7 +681,8 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
 
                 if (taskData.action === 'CREATE') {
-                    console.log(`[Slack] Creating task: ${taskData.title}`);
+                    logger.info(`Creating task: ${taskData.title}`, { traceId });
+                    
                     // FIX: Using correct parent structure for 2025 API
                     await notion.pages.create({
                         parent: { type: "data_source_id", data_source_id: sourceId },
@@ -671,7 +702,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     }
 
                     if (pageId) {
-                        console.log(`[Slack Action] Updating Page ID: ${pageId}`);
+                        logger.info(`Updating Page ID: ${pageId}`, { traceId });
                         notionProperties["Notes"] = { 
                             rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
                         };
@@ -693,6 +724,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             
             // --- B. HANDLE "SKIP" ---
             else if (action.action_id === 'skip_task') {
+                logger.info(`Task skipped: ${taskData.title}`, { traceId });
                 return res.status(200).json({
                     replace_original: "true",
                     text: `⏭️ *Skipped*`
@@ -701,20 +733,14 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
 
             // --- C. HANDLE "FEEDBACK" (Open Modal) ---
             else if (action.action_id === 'feedback_task') {
-                let taskData = {};
-                try {
-                     taskData = JSON.parse(action.value);
-                } catch(e) {
-                    console.log("Feedback button missing payload.", e);
-                }
-
                 const sessionId = crypto.randomUUID();
 
-                // Store in memory
+                // Store in memory with trace ID
                 feedbackSessions.set(sessionId, {
                     task: taskData,
                     iteration: 1,
-                    aiSuggestion: taskData
+                    aiSuggestion: taskData,
+                    traceId: traceId
                 });
 
                 // Open the modal
@@ -740,19 +766,21 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             const session = feedbackSessions.get(sessionId);
 
             if (!session) {
+                // Failsafe if session lost
                 return res.status(200).json({ response_action: "clear" }); 
             }
 
             // 2. Extract ALL Values
             const v = payload.view.state.values;
+            // Helpers to safe-get
             const getVal = (block, action) => v[block]?.[action]?.value;
-            const getSel = (block, action) => v[block]?.[action]?.selected_option?.value; // For static selects
-            const getTxt = (block, action) => v[block]?.[action]?.selected_option?.text?.text; // For text-based selects
+            const getSel = (block, action) => v[block]?.[action]?.selected_option?.value;
+            const getTxt = (block, action) => v[block]?.[action]?.selected_option?.text?.text;
             const getDate = (block, action) => v[block]?.[action]?.selected_date;
 
             // 3. Update Task Data
             const updatedTask = {
-                ...session.task, // preserve IDs
+                ...session.task, // preserve IDs & Trace ID
                 title: getVal('title_block', 'title'),
                 notes: getVal('notes_block', 'notes') + "\n(Refined by User)",
                 owner: getVal('owner_block', 'owner'),
@@ -774,13 +802,17 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             session.task = updatedTask;
             feedbackSessions.set(sessionId, session);
 
-            // 5. POST NEW MESSAGE TO SLACK (The Loop)
             const targetDbId = updatedTask.targetDbId || NOTION_TASK_DB_ID;
+            const traceId = session.traceId || "unknown_trace";
             
+            logger.info(`Feedback submitted. Posting v${session.iteration} to chat.`, { traceId });
+            
+            // 5. THE LOOP: Send a NEW Slack Message with the updated task
             await sendTaskListToSlack(
                 [updatedTask], 
                 `Refined Proposal (v${session.iteration})`, 
-                targetDbId
+                targetDbId,
+                traceId // Keep the trace ID going!
             );
             
             // 6. Close Modal
@@ -788,28 +820,24 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         }
 
     } catch (error) {
-        console.error("Slack Interaction Error:", error.message);
+        logger.error("Slack Interaction Error", error);
         res.status(500).send("Error");
     }
 });
 
+// --- LEGACY ENDPOINT ---
 app.post('/api/v1/slack-approved-tasks', async (req, res) => {
     // This was your old endpoint for bulk approval, leaving it as requested.
     const approvedTasks = req.body.tasks; 
-    
     if (!approvedTasks || approvedTasks.length === 0) {
         return res.status(400).send({ message: "No tasks provided for update." });
     }
-    try {
-        // await updateNotionDB(approvedTasks); // This function was mocked in your snippet
-        res.status(200).send({ message: 'Legacy endpoint: Notion database update logic moved to interactive buttons.' });
-    } catch (error) {
-        console.error('Failed to process approved tasks:', error.message);
-        res.status(500).send({ message: 'Failed to update Notion DB.' });
-    }
+    // await updateNotionDB(approvedTasks); // Mocked legacy call
+    res.status(200).send({ message: 'Legacy endpoint: Notion database update logic moved to interactive buttons.' });
 });
 
 
+// --- LEGACY ENDPOINT ---
 app.post('/api/v1/normalize', async (req, res) => {
     const { transcript, source, source_id, meeting_title, participants, raw_transcript } = req.body; 
     
@@ -818,9 +846,10 @@ app.post('/api/v1/normalize', async (req, res) => {
     }
 
     try {
+        const traceId = crypto.randomUUID(); // Generate local trace
         const initialData = { source, source_id, meeting_title, participants };
         
-        const normalizedJson = await normalizeTranscript(transcript, initialData);
+        const normalizedJson = await normalizeTranscript(transcript, initialData, traceId);
 
         // --- DB Saving ---
         const TranscriptModel = mongoose.model('NormalizedTranscript');
@@ -843,250 +872,205 @@ app.post('/api/v1/normalize', async (req, res) => {
         const newTranscript = new TranscriptModel(transcriptDocument);
         await newTranscript.save();
         
-        console.log(`  -> Saved normalized data to DB with ID: ${normalizedJson.transcript_id}`);
+        logger.info(`Saved normalized data to DB: ${normalizedJson.transcript_id}`, { traceId });
 
         res.status(200).send({ normalized_json: normalizedJson });
     } catch (error) {
-        console.error('Normalization process failed:', error.message);
+        logger.error('Normalization process failed', error);
         res.status(500).send({ message: `Normalization failed: ${error.message}` });
     }
 });
 
+// --- LEGACY ENDPOINT ---
 app.post('/api/v1/generate-tasks', async (req, res) => {
     const { normalized_data } = req.body;
-    
     const extractedProjects = normalized_data.extracted_entities.projects || [];
 
     try {
-        // STEP 3: Retrieve project data from Notion DB
         const actualNotionContext = await queryNotionDB(extractedProjects);
-
-        // STEP 4: Generate/Compare Task List
         const taskList = await generateTaskList(normalized_data, actualNotionContext);
-
         res.status(200).send({ message: 'Task list generated and sent to Slack for approval.' });
-
     } catch (error) {
-        console.error('Task Generation process failed:', error.message);
+        logger.error('Task Generation process failed', error);
         res.status(500).send({ message: 'Failed to generate task list.', error: error.message });
     }
 });
 
 
 
-// full process
-
-// ----------------- PROCESS TRANSCRIPT ENDPOINT -----------------
+// ==========================================================================
+//  MAIN PROCESS ENDPOINT (TRACE ENABLED)
+// ==========================================================================
 
 app.post('/api/v1/process-transcript', async (req, res) => {
   try {
-    const { transcript, source, source_id, meeting_title, participants, raw_transcript } = req.body;
+    const { transcript, source, source_id, meeting_title, participants, raw_transcript, request_id } = req.body;
+
+    // 1. Trace ID Handling
+    // Accept from webhook, or generate new one.
+    const traceId = request_id || req.body.trace_id || crypto.randomUUID();
+    
+    // START LOGGING WITH TRACE
+    logger.info(`🚀 Processing started for source: ${source}`, { traceId });
 
     if (!transcript) {
+      logger.warn("Missing transcript.", { traceId });
       return res.status(400).send({ error: "Transcript text is required." });
     }
 
-    // --- 1) Normalize with GPT ---
+    // 2. Normalize with GPT (Pass Trace ID)
     const normalized = await normalizeTranscript(transcript, {
       source,
       source_id,
       meeting_title,
       participants
-    });
+    }, traceId);
 
-    // Get project name out of normalized data
-    const projectBlock =
-      normalized.extracted_entities.projects &&
-      normalized.extracted_entities.projects[0];
-
-    const projectName =
-      projectBlock && projectBlock.project_name
-        ? projectBlock.project_name.trim()
-        : null;
-
-    if (!projectName) {
-      return res.status(400).send({ error: "No project name found in normalized data." });
+    // --- DB Saving (With Trace ID) ---
+    try {
+        const TranscriptModel = mongoose.model('NormalizedTranscript');
+        const transcriptDocument = {
+            transcript_id: traceId, // Use trace ID as primary key
+            source: source || "unknown",
+            source_id: source_id || "unknown",
+            meeting_title: meeting_title || "Untitled",
+            participants: participants || [],
+            raw_transcript: raw_transcript || transcript,
+            normalized_data: { 
+                summary: normalized.summary,
+                extracted_entities: normalized.extracted_entities,
+                quality_metrics: normalized.quality_metrics,
+                source_specific: normalized.source_specific || {},
+            }
+        };
+        const newTranscript = new TranscriptModel(transcriptDocument);
+        await newTranscript.save();
+        logger.info("Saved transcript to DB.", { traceId });
+    } catch (dbError) {
+        logger.error("DB Save Failed", dbError, { traceId });
+        // Don't fail the whole process if DB fails, continue to Notion/Slack
     }
 
-   // --- 2) Load all Notion databases ---
-const allSources = await listAllNotionDatabases();
+    // 3. Project Matching
+    const projectBlock = normalized.extracted_entities.projects && normalized.extracted_entities.projects[0];
+    const projectName = projectBlock && projectBlock.project_name ? projectBlock.project_name.trim() : null;
 
-if (!allSources || allSources.length === 0) {
-  return res.status(500).send({ error: "No Notion databases found." });
-}
+    if (!projectName) {
+        logger.warn("No project name found in data.", { traceId });
+        return res.status(400).send({ error: "No project name found in normalized data." });
+    }
 
-// --- 3) Find best matching DB using GPT ---
-let chosenTitle = await findBestDatabaseMatch(projectName, allSources);
+    // 4. Load Notion DBs
+    const allSources = await listAllNotionDatabases();
+    if (!allSources || allSources.length === 0) return res.status(500).send({ error: "No Notion databases found." });
 
-// Fallback: simple contains match
-if (!chosenTitle) {
-  chosenTitle = allSources.find(ds =>
-    ds.title.toLowerCase().includes(projectName.toLowerCase())
-  )?.title;
-}
+    let chosenTitle = await findBestDatabaseMatch(projectName, allSources);
+    if (!chosenTitle) {
+      chosenTitle = allSources.find(ds => ds.title.toLowerCase().includes(projectName.toLowerCase()))?.title;
+    }
 
-if (!chosenTitle) {
-  return res.status(404).send({ error: "No matching Notion DB found." });
-}
+    if (!chosenTitle) {
+      return res.status(404).send({ error: "No matching Notion DB found." });
+    }
 
-const match = allSources.find(ds => ds.title === chosenTitle);
+    const match = allSources.find(ds => ds.title === chosenTitle);
+    logger.info(`Best DB match: "${match.title}" (ID: ${match.id})`, { traceId });
 
-console.log(
-  `[Notion] Best DB match for project "${projectName}": "${match.title}" (ID: ${match.id})`
-);
-
-    // --- 3) Get all rows from Notion ---
-    console.log(`[Notion] Fetching all rows from DB: ${match.id}`);
+    // 5. Get Existing Context
+    logger.info("Fetching existing rows for context...", { traceId });
     const allPages = await fetchAllRowsInDataSource(match.id);
-
     const pages = allPages.map(simplifyAnyPage);
-    console.log(`  -> Retrieved ${pages.length} pages from Notion DB.`);
-
-    // Simplify each page (so we only use title, status, notes, url)
     const existingTasks = pages.map(page => ({
-  id: page.id || "",
-  // FIX: Using 'task' which is derived from 'simplifyAnyPage' mapping (make sure helper handles 'Tasks' col)
-  title: page.task || "",           
-  status: page.status || "",
-  notes: page.notes || "",         
-  url: `https://www.notion.so/${(page.id || "").replace(/-/g, "")}`
-}));
+        id: page.id || "",
+        title: page.task || "",           
+        status: page.status || "",
+        notes: page.notes || "",         
+        url: `https://www.notion.so/${(page.id || "").replace(/-/g, "")}`
+    }));
 
-    // --- 4) Build array of normalized proposals ---
+    // 6. Generate Proposals
     const proposals = normalized.extracted_entities.projects.flatMap(p =>
-  p.tasks.map(t => ({
-    title: t.task_title,
-    project: p.project_name,
-    notes: t.notes,
-    status: t.status,
-    owner: t.owner && t.owner !== "" ? t.owner : "Unassigned",
-    priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
-    linked_jtbd: t.linked_jtbd?.name || "TBD",
-    // Pass new fields
-    start_date: t.start_date,
-    due_date: t.due_date,
-    focus_this_week: t.focus_this_week
-  }))
-);
+        p.tasks.map(t => ({
+            title: t.task_title,
+            project: p.project_name,
+            notes: t.notes,
+            status: t.status,
+            owner: t.owner || "Unassigned",
+            priority: t.priority_level || "Medium",
+            linked_jtbd: t.linked_jtbd?.name || "TBD",
+            start_date: t.start_date,
+            due_date: t.due_date,
+            focus_this_week: t.focus_this_week
+        }))
+    );
 
-
-    // --- 5) Semantic compare with GPT for UPDATE vs CREATE ---
+    // 7. Semantic Compare (Create vs Update)
     const finalOutput = [];
-
     for (const proposal of proposals) {
       try {
-        // Prompt tailored to your comparison rules
        const comparePrompt = `
-You are the Prouvé Sync Manager.
+        You are the Prouvé Sync Manager. Decide CREATED or UPDATED.
+        
+        MATCHING RULES:
+        - UPDATE only if the proposal clearly refers to the SAME OUTCOME
+        - Match by meaning, not wording
+        - If multiple matches exist, choose the BEST ONE
 
-Decide whether the task proposal should be CREATED or UPDATED.
+        FIELD PRESERVATION RULE:
+        - owner MUST be copied from proposal.owner
+        - priority MUST be copied from proposal.priority
+        - linked_jtbd MUST be copied from proposal.linked_jtbd
+        - start_date MUST be copied from proposal.start_date
+        - due_date MUST be copied from proposal.due_date
+        - focus_this_week MUST be copied from proposal.focus_this_week
 
-MATCHING RULES:
-- UPDATE only if the proposal clearly refers to the SAME OUTCOME
-- Match by meaning, not wording
-- If multiple matches exist, choose the BEST ONE
+        STRICT OUTPUT RULES:
+        - If UPDATE: notion_url MUST be copied EXACTLY from matched existing task
+        - If CREATE: notion_url MUST be exactly "New Task"
 
-FIELD PRESERVATION RULE:
-- owner MUST be copied from proposal.owner
-- priority MUST be copied from proposal.priority
-- linked_jtbd MUST be copied from proposal.linked_jtbd
-- start_date MUST be copied from proposal.start_date
-- due_date MUST be copied from proposal.due_date
-- focus_this_week MUST be copied from proposal.focus_this_week
-- Do NOT invent or erase these fields
+        TASK PROPOSAL:
+        ${JSON.stringify(proposal)}
 
+        EXISTING NOTION TASKS:
+        ${JSON.stringify(existingTasks)}
 
-STRICT OUTPUT RULES:
-- If UPDATE:
-  - notion_url MUST be copied EXACTLY from the matched existing task
-  - status MUST come from the matched existing task
-- If CREATE:
-  - notion_url MUST be exactly "New Task"
-  - status MUST come from proposal.status
+        RETURN ONLY VALID JSON. 
+        Structure: { action: "CREATE" | "UPDATE", notion_url: "...", title: "...", ...all_fields }
+        `;
 
-DISPLAY LINE RULE:
-- "✓ Task CREATED: <title>"
-- "✓ Task UPDATED: <title>"
+        const gptResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            body: JSON.stringify({
+              model: "gpt-5.2",
+              messages: [{ role: "user", content: comparePrompt }],
+              response_format: { type: "json_object" } 
+            }),
+        });
 
-TASK PROPOSAL:
-${JSON.stringify(proposal)}
+        const jsonResp = await gptResponse.json();
+        const content = jsonResp.choices?.[0]?.message?.content;
+        const parsed = JSON.parse(content);
+        
+        if (parsed.action === "UPDATE" && parsed.notion_url === "New Task") {
+            // Safety check
+            throw new Error("UPDATE action returned without Notion URL");
+        }
 
-EXISTING NOTION TASKS:
-${JSON.stringify(existingTasks)}
-
-RETURN ONLY VALID JSON
-NO commentary
-NO markdown
-
-OUTPUT SCHEMA:
-{
-  "display_line": "string",
-  "action": "CREATE | UPDATE",
-  "notion_url": "string",
-  "title": "string",
-  "owner": "string",
-  "priority": "string",
-  "linked_jtbd": "string",
-  "project": "string",
-  "notes": "string",
-  "status": "string",
-  "start_date": "string or null",
-  "due_date": "string or null",
-  "focus_this_week": "string"
-}
-`;
-
-
-
-        // Call GPT for semantic comparison
-const gptResponse = await fetch(
-  "https://api.openai.com/v1/chat/completions",
-  {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-5.2",
-      messages: [
-        { role: "system", content: "You compare tasks and return strict JSON only." },
-        { role: "user", content: comparePrompt }
-      ],
-      temperature: 0,
-      response_format: { type: "json_object" } 
-    }),
-  }
-);
-
-
-const jsonResp = await gptResponse.json();
-
-const content = jsonResp.choices?.[0]?.message?.content;
-console.log("🧠 GPT RAW OUTPUT:", content);
-
-const parsed = JSON.parse(content);
-
-if (parsed.action === "UPDATE" && parsed.notion_url === "New Task") {
-  throw new Error("UPDATE action returned without Notion URL");
-}
-
-
-finalOutput.push(parsed);
+        finalOutput.push(parsed);
       } catch (err) {
-        console.error("Comparison error:", err);
+        logger.error("Comparison error", err, { traceId });
       }
     }
 
+    // 8. Send to Slack (Pass Trace ID!)
+    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting", match.id, traceId);
 
-    // --- 6) SEND TO SLACK WITH BUTTONS AND TARGET DB ID ---
-    // UPDATED CALL: Pass match.id (Target DB ID)
-    await sendTaskListToSlack(finalOutput, meeting_title || "Virtual Meeting", match.id);
+    // 9. Return Result
+    return res.status(200).send({ trace_id: traceId, result: finalOutput });
 
-    // --- 7) Return results ---
-    return res.status(200).send(finalOutput);
   } catch (error) {
-    console.error("PROCESS ERROR:", error.message);
+    logger.error("PROCESS ERROR", error);
     return res.status(500).send({ error: error.message });
   }
 });
@@ -1095,7 +1079,7 @@ finalOutput.push(parsed);
 // --- DEBUG FUNCTION: CORRECTED ---
 const debugNotionAccess = async () => {
     try {
-        console.log("🔍 Checking Notion Access...");
+        logger.info("🔍 Checking Notion Access...");
         
         // FIX: Removed the 'filter' parameter completely to avoid the validation error.
         // We will fetch everything and filter for databases manually below.
@@ -1116,14 +1100,14 @@ const debugNotionAccess = async () => {
         }
         console.log("---------------------------------------\n");
     } catch (error) {
-        console.error("❌ Notion Connection Error:", error.message);
+        logger.error("Notion Connection Error", error);
     }
 };
 
 // Start the server
 const startServer = async () => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
-        console.warn("\n NOTION KEYS MISSING: Notion integration will be mocked.");
+        logger.warn("NOTION KEYS MISSING: Notion integration will be mocked.");
     }
     
     // CALL THE DEBUG FUNCTION HERE
@@ -1131,7 +1115,7 @@ const startServer = async () => {
 
     await connectDB();
     app.listen(PORT, () => {
-        console.log(`🧠 MCP Server running on port ${PORT}`);
+        logger.info(`🧠 MCP Server running on port ${PORT}`);
     });
 };
 
