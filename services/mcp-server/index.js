@@ -722,11 +722,34 @@ app.post('/api/v1/process-transcript', async (req, res) => {
     const finalOutput = [];
     for (const proposal of proposals) {
       try {
-       const comparePrompt = `
+       const comparePrompt =  `
         You are the Prouvé Sync Manager. Decide CREATED or UPDATED.
-        TASK PROPOSAL: ${JSON.stringify(proposal)}
-        EXISTING NOTION TASKS: ${JSON.stringify(existingTasks)}
-        RETURN JSON ONLY. { action: "CREATE" | "UPDATE", notion_url: "...", title: "...", ...all_fields }
+        
+        MATCHING RULES:
+        - UPDATE only if the proposal clearly refers to the SAME OUTCOME
+        - Match by meaning, not wording
+        - If multiple matches exist, choose the BEST ONE
+
+        FIELD PRESERVATION RULE:
+        - owner MUST be copied from proposal.owner
+        - priority MUST be copied from proposal.priority
+        - linked_jtbd MUST be copied from proposal.linked_jtbd
+        - start_date MUST be copied from proposal.start_date
+        - due_date MUST be copied from proposal.due_date
+        - focus_this_week MUST be copied from proposal.focus_this_week
+
+        STRICT OUTPUT RULES:
+        - If UPDATE: notion_url MUST be copied EXACTLY from matched existing task
+        - If CREATE: notion_url MUST be exactly "New Task"
+
+        TASK PROPOSAL:
+        ${JSON.stringify(proposal)}
+
+        EXISTING NOTION TASKS:
+        ${JSON.stringify(existingTasks)}
+
+        RETURN ONLY VALID JSON. 
+        Structure: { action: "CREATE" | "UPDATE", notion_url: "...", title: "...", ...all_fields }
         `;
         const gptResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -811,17 +834,8 @@ app.post('/api/v1/generate-tasks', async (req, res) => {
     }
 });
 
-// --- DEBUG FUNCTION ---
-const debugNotionAccess = async () => {
-    try {
-        const response = await notion.search({}); 
-        const databases = response.results.filter(item => item.object === 'database' || item.object === 'data_source');
-        console.log(`\n--- 📋 FOUND ${databases.length} DATABASES ---`);
-    } catch (error) { logger.error("Notion Connection Error", error); }
-};
 
 const startServer = async () => {
-    await debugNotionAccess(); 
     await connectDB();
     app.listen(PORT, () => { logger.info(`🧠 MCP Server running on port ${PORT}`); });
 };
