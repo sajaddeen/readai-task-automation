@@ -487,9 +487,14 @@ const generateTaskList = async (normalizedData, notionContext) => {
 //  ENDPOINT: SLACK INTERACTION (SEQUENTIAL LOOP)
 // ==========================================================================
 
+// ==========================================================================
+//  ENDPOINT: SLACK INTERACTION (ASYNC UPDATE FIX)
+// ==========================================================================
+
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
         const payload = JSON.parse(req.body.payload);
+        const responseUrl = payload.response_url; // <--- KEY: Url to update message later
 
         // -------------------------------------
         // CASE 1: BUTTON CLICKS (ACCEPT / SKIP)
@@ -499,97 +504,122 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             const taskData = JSON.parse(action.value);
             const traceId = taskData.traceId || "no_trace_id";
 
-            // --- A. ACCEPT ---
-            if (action.action_id === 'accept_task') {
-                const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
-                const notionProperties = {
-                    "Tasks": { title: [{ text: { content: taskData.title } }] },
-                    "Status": { status: { name: taskData.status || "To do" } },
-                    "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
-                    "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
-                    "Priority Level": { select: { name: taskData.priority || "Medium" } },
-                    "Source": { select: { name: "Virtual Meeting" } },
-                    "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
-                    "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
-                };
-                if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
-                if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
+            // 1. ACKNOWLEDGE IMMEDIATELY (Fixes 3s Timeout)
+            // We tell Slack "We got it, stop loading." We will update the UI later.
+            res.status(200).send(); 
 
-                if (taskData.action === 'CREATE') {
-                    logger.info(`Creating task: ${taskData.title}`, { traceId });
-                    await notion.pages.create({ parent: { type: "data_source_id", data_source_id: sourceId }, properties: notionProperties });
+            // 2. PERFORM WORK IN BACKGROUND
+            (async () => {
+                try {
+                    // --- A. ACCEPT ---
+                    if (action.action_id === 'accept_task') {
+                        const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
+                        const notionProperties = {
+                            "Tasks": { title: [{ text: { content: taskData.title } }] },
+                            "Status": { status: { name: taskData.status || "To do" } },
+                            "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
+                            "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
+                            "Priority Level": { select: { name: taskData.priority || "Medium" } },
+                            "Source": { select: { name: "Virtual Meeting" } },
+                            "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
+                            "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
+                        };
+                        if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
+                        if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
+
+                        let successMsg = "";
+
+                        // -- Notion Operation --
+                        if (taskData.action === 'CREATE') {
+                            logger.info(`Creating task: ${taskData.title}`, { traceId });
+                            await notion.pages.create({ parent: { type: "data_source_id", data_source_id: sourceId }, properties: notionProperties });
+                            successMsg = `✅ *Successfully Created* \n${taskData.title}`;
+                        } else if (taskData.action === 'UPDATE') {
+                            let pageId = taskData.id; 
+                            if (!pageId && taskData.notion_url) {
+                                const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
+                                if(matches) pageId = matches[0];
+                            }
+                            if (pageId) {
+                                logger.info(`Updating Page ID: ${pageId}`, { traceId });
+                                notionProperties["Notes"] = { rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] };
+                                await notion.pages.update({ page_id: pageId, properties: notionProperties });
+                                successMsg = `✅ *Successfully Updated* \n${taskData.title}`;
+                            }
+                        }
+
+                        // 3. SEND SUCCESS BOX (VIA AXIOS)
+                        // This updates the message *after* Notion is done
+                        if (responseUrl) {
+                            await axios.post(responseUrl, {
+                                replace_original: true,
+                                blocks: [
+                                    {
+                                        type: "section",
+                                        text: { type: "mrkdwn", text: successMsg }
+                                    }
+                                ]
+                            });
+                        }
+
+                        // 4. TRIGGER NEXT ITEM
+                        const queue = proposalQueues.get(traceId);
+                        if (queue) {
+                            queue.currentIndex++; 
+                            proposalQueues.set(traceId, queue);
+                            await sendNextProposal(traceId);
+                        }
+                    } 
                     
-                    // UPDATE MESSAGE TO SUCCESS
-                    res.status(200).json({ replace_original: "true", // <--- This tells Slack "Overwrite the previous message"
-        blocks: [
-            {
-                type: "section",
-                // It dynamically inserts the specific task title here 👇
-                text: { type: "mrkdwn", text: `✅ *Successfully Created* \n${taskData.title}` } 
-            }
-        ] });
-
-                } else if (taskData.action === 'UPDATE') {
-                    let pageId = taskData.id; 
-                    if (!pageId && taskData.notion_url) {
-                        const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
-                        if(matches) pageId = matches[0];
-                    }
-                    if (pageId) {
-                        logger.info(`Updating Page ID: ${pageId}`, { traceId });
-                        notionProperties["Notes"] = { rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] };
-                        await notion.pages.update({ page_id: pageId, properties: notionProperties });
+                    // --- B. SKIP ---
+                    else if (action.action_id === 'skip_task') {
+                        logger.info(`Skipped task: ${taskData.title}`, { traceId });
                         
-                        // UPDATE MESSAGE TO SUCCESS
-                        res.status(200).json({ replace_original: "true",
-        blocks: [
-            {
-                type: "section",
-                // Updates get a different message 👇
-                text: { type: "mrkdwn", text: `✅ *Successfully Updated* \n${taskData.title}` }
-            }
-        ] });
+                        // Send Skip Box
+                        if (responseUrl) {
+                            await axios.post(responseUrl, {
+                                replace_original: true,
+                                blocks: [
+                                    {
+                                        type: "section",
+                                        text: { type: "mrkdwn", text: `⏭️ *Skipped Task* \n~${taskData.title}~` }
+                                    }
+                                ]
+                            });
+                        }
+
+                        // Trigger Next
+                        const queue = proposalQueues.get(traceId);
+                        if (queue) {
+                            queue.currentIndex++; 
+                            proposalQueues.set(traceId, queue);
+                            await sendNextProposal(traceId);
+                        }
                     }
-                }
 
-                // ** TRIGGER NEXT ITEM **
-                const queue = proposalQueues.get(traceId);
-                if (queue) {
-                    queue.currentIndex++; // Move index forward
-                    proposalQueues.set(traceId, queue);
-                    setTimeout(() => sendNextProposal(traceId), 1000); // Small delay for UX
-                }
-            } 
-            
-            // --- B. SKIP ---
-            else if (action.action_id === 'skip_task') {
-                logger.info(`Skipped task: ${taskData.title}`, { traceId });
-                
-                // UPDATE MESSAGE TO SKIPPED
-                res.status(200).json({ replace_original: "true", text: `⏭️ *Skipped Task:* ${taskData.title}` });
+                    // --- C. FEEDBACK (OPEN MODAL) ---
+                    else if (action.action_id === 'feedback_task') {
+                        const sessionId = crypto.randomUUID();
+                        feedbackSessions.set(sessionId, { task: taskData, iteration: 1, traceId: traceId });
+                        // We ack'd early, but trigger_id is still valid for 3 seconds. Open modal now.
+                        await openFeedbackModal(payload.trigger_id, { ...taskData, iteration: 1 }, sessionId);
+                    }
 
-                // ** TRIGGER NEXT ITEM **
-                const queue = proposalQueues.get(traceId);
-                if (queue) {
-                    queue.currentIndex++; 
-                    proposalQueues.set(traceId, queue);
-                    setTimeout(() => sendNextProposal(traceId), 1000); 
+                } catch (err) {
+                    logger.error("Async Interaction Failed", err, { traceId });
                 }
-            }
+            })();
 
-            // --- C. FEEDBACK (OPEN MODAL) ---
-            else if (action.action_id === 'feedback_task') {
-                const sessionId = crypto.randomUUID();
-                feedbackSessions.set(sessionId, { task: taskData, iteration: 1, traceId: traceId });
-                await openFeedbackModal(payload.trigger_id, { ...taskData, iteration: 1 }, sessionId);
-                return res.status(200).send();
-            }
+            return;
         }
 
         // -------------------------------------
         // CASE 2: MODAL SUBMISSION
         // -------------------------------------
         if (payload.type === 'view_submission' && payload.view.callback_id === 'feedback_modal_submit') {
+            // Modals expect a specific JSON response to close (response_action: clear).
+            // We CANNOT ack immediately with empty 200 here. We must return the json at the end.
+            
             const metadata = JSON.parse(payload.view.private_metadata);
             const session = feedbackSessions.get(metadata.sessionId);
             if (!session) return res.status(200).json({ response_action: "clear" }); 
@@ -613,25 +643,22 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 linked_jtbd: getVal('jtbd_block', 'jtbd')
             };
 
-            // UPDATE QUEUE WITH EDITED TASK
             const queue = proposalQueues.get(session.traceId);
             if (queue) {
-                // Replace the task at current index with updated version
+                // Update memory
                 queue.tasks[queue.currentIndex] = updatedTask;
                 proposalQueues.set(session.traceId, queue);
                 
-                // Repost the message by re-triggering the "sendNext" logic (but keeping index same)
-                // This sends a fresh message at the bottom of the chat.
+                // Repost the message (re-triggers the "sendNext" logic but keeps index same)
                 setTimeout(() => sendNextProposal(session.traceId), 500); 
             }
 
-            // Close the modal
             return res.status(200).json({ response_action: "clear" });
         }
 
     } catch (error) {
         logger.error("Slack Interaction Error", error);
-        res.status(500).send("Error");
+        if (!res.headersSent) res.status(500).send("Error");
     }
 });
 
