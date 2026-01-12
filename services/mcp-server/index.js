@@ -1,13 +1,11 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-// FIX: We no longer need the OpenAI package, only the mongoose instance and connection
 const { connectDB } = require('@read-ai/shared-config');
 const mongoose = require('mongoose');
 const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
-// Ensure these utility files exist in your project structure
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
 
@@ -15,7 +13,7 @@ const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
-const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
+const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID;
 const PORT = process.env.MCP_PORT || 3001;
 const app = express();
 
@@ -36,37 +34,30 @@ sessionId => {
 }
 */
 
-// --- NEW: FEEDBACK MODAL BUILDER (Helper Function) ---
+// --- NEW: FEEDBACK MODAL BUILDER (All Fields) ---
 const openFeedbackModal = async (triggerId, task, sessionId) => {
     await slackClient.views.open({
       trigger_id: triggerId,
       view: {
         type: "modal",
         callback_id: "feedback_modal_submit",
-        private_metadata: JSON.stringify({ sessionId }), // Pass ID to recover state
-        title: { type: "plain_text", text: "Refine Task" },
-        submit: { type: "plain_text", text: "Refine & Loop" }, // Infinite loop button
+        private_metadata: JSON.stringify({ sessionId }), 
+        title: { type: "plain_text", text: "Feedback Form" },
+        submit: { type: "plain_text", text: "Submit Feedback" },
         close: { type: "plain_text", text: "Cancel" },
         blocks: [
-          {
-            type: "context",
-            elements: [
-              {
-                type: "mrkdwn",
-                text: `🧠 *Iteration ${task.iteration || 1}* — Review details below.`
-              }
-            ]
-          },
+          // 1. TITLE
           {
             type: "input",
             block_id: "title_block",
-            label: { type: "plain_text", text: "Title" },
+            label: { type: "plain_text", text: "Task Title" },
             element: {
               type: "plain_text_input",
               action_id: "title",
               initial_value: task.title
             }
           },
+          // 2. NOTES
           {
             type: "input",
             block_id: "notes_block",
@@ -78,13 +69,121 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
               initial_value: task.notes
             }
           },
-          // Optional: Context display for hidden fields
+          // 3. ROW: OWNER & PROJECT
           {
-            type: "context",
-            elements: [
-              { type: "mrkdwn", text: `*Dates:* ${task.start_date || "—"} to ${task.due_date || "—"}` },
-              { type: "mrkdwn", text: `*Owner:* ${task.owner || "Unassigned"}` }
-            ]
+            type: "section",
+            text: { type: "mrkdwn", text: "*Task Details*" }
+          },
+          {
+            type: "input",
+            block_id: "owner_block",
+            label: { type: "plain_text", text: "Owner" },
+            element: {
+              type: "plain_text_input",
+              action_id: "owner",
+              initial_value: task.owner || "Unassigned"
+            }
+          },
+          {
+            type: "input",
+            block_id: "project_block",
+            label: { type: "plain_text", text: "Project" },
+            element: {
+              type: "plain_text_input",
+              action_id: "project",
+              initial_value: task.project || "General"
+            }
+          },
+          // 4. PRIORITY & STATUS (Selects)
+          {
+            type: "input",
+            block_id: "priority_block",
+            label: { type: "plain_text", text: "Priority" },
+            element: {
+                type: "static_select",
+                action_id: "priority",
+                initial_option: {
+                    text: { type: "plain_text", text: task.priority || "Medium" },
+                    value: task.priority || "Medium"
+                },
+                options: [
+                    { text: { type: "plain_text", text: "High" }, value: "High" },
+                    { text: { type: "plain_text", text: "Medium" }, value: "Medium" },
+                    { text: { type: "plain_text", text: "Low" }, value: "Low" }
+                ]
+            }
+          },
+          {
+            type: "input",
+            block_id: "status_block",
+            label: { type: "plain_text", text: "Status" },
+            element: {
+                type: "static_select",
+                action_id: "status",
+                initial_option: {
+                    text: { type: "plain_text", text: task.status || "To do" },
+                    value: task.status || "To do"
+                },
+                options: [
+                    { text: { type: "plain_text", text: "To do" }, value: "To do" },
+                    { text: { type: "plain_text", text: "In progress" }, value: "In progress" },
+                    { text: { type: "plain_text", text: "Done" }, value: "Done" }
+                ]
+            }
+          },
+          // 5. DATES
+          {
+             type: "input",
+             block_id: "start_date_block",
+             optional: true,
+             label: { type: "plain_text", text: "Start Date" },
+             element: {
+                 type: "datepicker",
+                 action_id: "start_date",
+                 initial_date: task.start_date || undefined,
+                 placeholder: { type: "plain_text", text: "Select a date" }
+             }
+          },
+          {
+             type: "input",
+             block_id: "due_date_block",
+             optional: true,
+             label: { type: "plain_text", text: "Due Date" },
+             element: {
+                 type: "datepicker",
+                 action_id: "due_date",
+                 initial_date: task.due_date || undefined,
+                 placeholder: { type: "plain_text", text: "Select a date" }
+             }
+          },
+          // 6. FOCUS & JTBD
+          {
+            type: "input",
+            block_id: "focus_block",
+            label: { type: "plain_text", text: "Focus This Week?" },
+            element: {
+                type: "static_select",
+                action_id: "focus",
+                initial_option: {
+                    text: { type: "plain_text", text: task.focus_this_week || "No" },
+                    value: task.focus_this_week || "No"
+                },
+                options: [
+                    { text: { type: "plain_text", text: "Yes" }, value: "Yes" },
+                    { text: { type: "plain_text", text: "No" }, value: "No" }
+                ]
+            }
+          },
+          {
+            type: "input",
+            block_id: "jtbd_block",
+            optional: true,
+            label: { type: "plain_text", text: "Linked JTBD" },
+            element: {
+              type: "plain_text_input",
+              action_id: "jtbd",
+              initial_value: typeof task.linked_jtbd === 'string' ? task.linked_jtbd : (task.linked_jtbd?.name || "")
+            }
           }
         ]
       }
@@ -92,7 +191,7 @@ const openFeedbackModal = async (triggerId, task, sessionId) => {
 };
 
 
-// --- SLACK MESSAGING HELPER WITH BUTTONS ---
+// --- SLACK MESSAGING HELPER ---
 
 const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
@@ -114,35 +213,29 @@ const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
 
     blocks.push({ type: "divider" });
 
-    // --- GENERATE VERTICAL LIST BLOCKS (Proposal X of Y) ---
+    // --- GENERATE VERTICAL LIST BLOCKS ---
     
-    // We iterate through ALL tasks to maintain the "X of Y" count
     taskList.forEach((task, index) => {
         const proposalCount = `${index + 1} of ${taskList.length}`;
         
-        // Prepare Button Payload (Includes new fields)
+        // Prepare Button Payload (Includes all fields so feedback loop works)
         const buttonPayload = JSON.stringify({
             ...task,
             targetDbId: targetDbId || NOTION_TASK_DB_ID,
-            // Sanitize notes to fit in button payload limit (3000 chars max usually)
             notes: task.notes.length > 500 ? task.notes.substring(0, 500) + "..." : task.notes
         });
 
-        // Format Linked JTBD (Slack Link format: <url|text>)
+        // Formats
         const jtbdDisplay = task.linked_jtbd_url && task.linked_jtbd_url.startsWith('http') 
             ? `<${task.linked_jtbd_url}|${task.linked_jtbd}>`
             : task.linked_jtbd || "TBD";
 
-        // Format Existing Task URL (for Updates)
         const existingTaskLine = task.action === 'UPDATE' && task.notion_url && task.notion_url !== "New Task"
             ? `*Existing task:* <${task.notion_url}|Open Notion Page>`
             : "";
 
-        // Determine Type Label
         const typeLabel = task.action === 'CREATE' ? "Create new Task" : "Update existing Task";
 
-        // --- THE FORMATTING MAGIC IS HERE ---
-        // Matches your requested structure exactly
         const detailsText = 
 `*Proposal ${proposalCount}*
 
@@ -166,13 +259,9 @@ ${existingTaskLine}
 *Notes:*
 ${task.notes}`;
 
-        // 1. Add the text block
         blocks.push({
             type: "section",
-            text: {
-                type: "mrkdwn",
-                text: detailsText
-            }
+            text: { type: "mrkdwn", text: detailsText }
         });
 
         // 2. Action Buttons
@@ -198,8 +287,7 @@ ${task.notes}`;
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
-                    // CRITICAL UPDATE: Pass full payload so modal can pre-fill
-                    value: buttonPayload
+                    value: buttonPayload 
                 }
             ]
         });
@@ -207,7 +295,6 @@ ${task.notes}`;
         blocks.push({ type: "divider" });
     });
 
-    // Handle empty list case
     if (taskList.length === 0) {
         blocks.push({
             type: "section",
@@ -238,7 +325,7 @@ const normalizeTranscript = async (transcript, initialData) => {
         throw new Error("OpenAI API Key is missing from environment variables.");
     }
     
-    // Schema definition - UPDATED FOR DATES AND FOCUS
+    // Schema definition
    const jsonFormatSchema = {
   "transcript_id": crypto.randomBytes(16).toString("hex"),
   "source": initialData.source,
@@ -248,11 +335,7 @@ const normalizeTranscript = async (transcript, initialData) => {
   "start_time": new Date(Date.now() - 3600000).toISOString(),
 
   "participants": [
-    {
-      "name": "string",
-      "email": "string",
-      "role": "string"
-    }
+    { "name": "string", "email": "string", "role": "string" }
   ],
 
   "summary": {
@@ -270,36 +353,26 @@ const normalizeTranscript = async (transcript, initialData) => {
     "projects": [
       {
         "project_name": "Island Way | Ridge Oak | Unknown",
-
         "tasks": [
           {
             "task_title": "string",
             "proposal_type": "Create new Task | Update existing Task",
-            "linked_jtbd": {
-              "name": "string",
-              "url": "string"
-            },
+            "linked_jtbd": { "name": "string", "url": "string" },
             "owner": "string",
             "status": "In progress | Done | To do",
             "priority_level": "High | Medium | Low",
             "source": "Virtual Meeting",
-            
-            // NEW FIELDS
             "start_date": "YYYY-MM-DD or null",
             "due_date": "YYYY-MM-DD or null",
             "focus_this_week": "Yes | No",
-            
             "notes": "2–4 sentence paragraph explaining action, context, dependencies, next step"
           }
         ],
-
         "associated_decisions": ["string"]
       }
     ]
   },
-
   "source_specific": {},
-
   "quality_metrics": {
     "transcription_accuracy": 0.95,
     "normalization_confidence": "number"
@@ -309,56 +382,24 @@ const normalizeTranscript = async (transcript, initialData) => {
     
 const prompt = `
 You are an expert task-extraction AI working for Prouvé projects.
-Your responsibility is to analyze a meeting transcript and extract
-CLEAR, ACTIONABLE, REVIEW-READY task proposals.
+Analyze the transcript and extract structured tasks.
 
 CRITICAL RULES:
-- You are in PROPOSE-ONLY MODE
-- Do NOT assume tasks are approved
-- Do NOT create or update anything
-- Every task must belong to EXACTLY ONE project
-- Supported projects: Island Way, Ridge Oak
-- If unsure of project → choose the MOST LIKELY one
+- Every task must belong to EXACTLY ONE project (Island Way or Ridge Oak).
+- If unsure of project → choose the MOST LIKELY one.
 
 CRITICAL NEW RULES (DATES & FOCUS):
-1. **Dates**: Extract concrete dates for 'start_date' and 'due_date' (YYYY-MM-DD). If strictly unknown, use null.
-2. **Focus This Week**: Set to "Yes" ONLY if the speaker explicitly says "this week", "urgent", "immediate", or "do it now". Otherwise "No".
+1. **Dates**: Extract 'start_date' and 'due_date' (YYYY-MM-DD). If unknown, use null.
+2. **Focus This Week**: "Yes" ONLY if urgent/"this week". Otherwise "No".
 
-TASK QUALITY REQUIREMENTS:
-- Task titles must be concise and outcome-focused
-- Notes must be 2–4 complete sentences
-- Notes must explain:
-  1) What needs to be done
-  2) Why it matters
-  3) Any dependencies or blockers
-  4) The next concrete step
-
-DUPLICATE AWARENESS:
-- If a task sounds like it already exists, mark it as:
-  "proposal_type": "Update existing Task"
-- Otherwise use:
-  "proposal_type": "Create new Task"
+TASK QUALITY:
+- Task titles must be concise.
+- Notes must be 2–4 sentences explaining context and next steps.
 
 JTBD LINKING:
-- ALWAYS attempt to link an existing JTBD
-- Provide BOTH name and URL
-- If unknown, use:
-  { "name": "TBD", "url": "TBD" }
+- Always try to link JTBD. If unknown: { "name": "TBD", "url": "TBD" }
 
-OWNER ASSIGNMENT:
-- Infer the most logical owner from participants
-- If unclear, assign "Unassigned"
-
-OUTPUT REQUIREMENTS:
-- Output MUST be VALID JSON
-- MUST strictly follow the provided schema
-- DO NOT add commentary or explanations outside JSON
-- DO NOT omit required fields
-- Participants MUST be an array of objects
-
-SPECIAL INSTRUCTION:
-Every extracted task MUST appear under:
-extracted_entities.projects[].tasks[]
+Output MUST be valid JSON matching the schema.
 
 Transcript:
 ${transcript}
@@ -367,11 +408,8 @@ Output JSON Schema:
 ${JSON.stringify(jsonFormatSchema)}
 `;
 
-
     try {
         console.log("--- RAW TRANSCRIPT SENT TO AI ---");
-        console.log("-----------------------------------");
-        console.log('  -> Sending request to OpenAI for normalization via native fetch...');
         
         const fetchResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
@@ -392,8 +430,8 @@ ${JSON.stringify(jsonFormatSchema)}
         }
 
         const completion = await fetchResponse.json();
-        if (!completion || !completion.choices || completion.choices.length === 0 || !completion.choices[0].message.content) {
-             throw new Error("OpenAI returned an empty or invalid completion object structure.");
+        if (!completion?.choices?.[0]?.message?.content) {
+             throw new Error("OpenAI returned an empty object.");
         }
         
         const normalizedJson = JSON.parse(completion.choices[0].message.content);
@@ -414,28 +452,20 @@ ${JSON.stringify(jsonFormatSchema)}
 
 const queryNotionDB = async (extractedProjects) => {
     if (!NOTION_TASK_DB_ID || !process.env.NOTION_API_KEY) {
-        console.warn("\n⚠️ NOTION KEYS MISSING: Skipping Notion DB query.");
         return { existing_tasks: [] };
     }
-
-    // REMOVED PROJECT FILTERING: Since 'Project' column might not exist, 
-    // we will query the DB directly without filtering by Project name to prevent crashes.
     
     console.log(`\n[Notion] Querying database...`);
     
     try {
         const response = await notion.dataSources.query({
             data_source_id: NOTION_TASK_DB_ID,
-            // Removed 'filter' so it doesn't crash on missing 'Project' column
-            // We only ask for 'Tasks' and 'Status' properties
             properties: ['Tasks', 'Status'], 
         });
 
         const existingTasks = response.results.map(page => ({
             task_id: page.id,
-            // FIX: Map from 'Tasks' property
             title: page.properties.Tasks?.title[0]?.plain_text || 'No Title',
-            // Defaulting project to Unassigned since column is gone
             project: 'Unassigned',
             status: page.properties.Status?.status?.name || 'Unknown',
             action: 'UPDATE', 
@@ -454,30 +484,25 @@ const queryNotionDB = async (extractedProjects) => {
 
 const generateTaskList = async (normalizedData, notionContext) => {
     
-    // 1. Flatten the hierarchical AI-extracted tasks into a single list
     const allAIExtractedTasks = normalizedData.extracted_entities.projects.flatMap(p => 
       p.tasks.map(t => ({
         title: t.task_title,
         project: p.project_name,
-        // Use logic to handle empty AI fields with Defaults
         owner: t.owner && t.owner !== "" ? t.owner : "Unassigned", 
         priority: t.priority_level && t.priority_level !== "" ? t.priority_level : "Medium",
         linked_jtbd: t.linked_jtbd?.name && t.linked_jtbd.name !== "TBD" ? t.linked_jtbd.name : "TBD",
         proposal_type: t.proposal_type,
         notes: t.notes,
         status: t.status,
-        // Pass through new fields
         start_date: t.start_date,
         due_date: t.due_date,
         focus_this_week: t.focus_this_week,
-        
         transcript_id: normalizedData.transcript_id
       }))
     );
     
     const taskList = [];
 
-    // 2. Identify and mark New Tasks
     for (const aiTask of allAIExtractedTasks) {
         const existingNotionTask = notionContext.existing_tasks.find(notionTask => 
             notionTask.title.toLowerCase().includes(aiTask.title.toLowerCase()) || 
@@ -492,21 +517,15 @@ const generateTaskList = async (normalizedData, notionContext) => {
                 priority: aiTask.priority, 
                 owner: aiTask.owner,       
                 linked_jtbd: aiTask.linked_jtbd,
-                
-                // Update dates/focus on existing task too
                 start_date: aiTask.start_date,
                 due_date: aiTask.due_date,
                 focus_this_week: aiTask.focus_this_week,
-
                 action: 'UPDATE',
                 transcript_id: normalizedData.transcript_id
             });
-            
-            // Remove from search pool to avoid duplicates
             notionContext.existing_tasks = notionContext.existing_tasks.filter(
                 t => t.task_id !== existingNotionTask.task_id
             );
-
         } else {
             // ACTION: CREATE
             taskList.push({
@@ -519,17 +538,13 @@ const generateTaskList = async (normalizedData, notionContext) => {
                 priority: aiTask.priority, 
                 linked_jtbd: aiTask.linked_jtbd,
                 notes: aiTask.notes,
-
-                // New fields
                 start_date: aiTask.start_date,
                 due_date: aiTask.due_date,
                 focus_this_week: aiTask.focus_this_week,
-
                 transcript_id: normalizedData.transcript_id
             });
         }
     }
-    
     return taskList;
 };
 
@@ -539,22 +554,16 @@ const generateTaskList = async (normalizedData, notionContext) => {
 const listAllNotionDatabases = async () => {
     try {
         console.log("\n[Notion] Listing all databases via Search API...");
-
         let allDBs = [];
         let cursor = undefined;
-
         do {
-            // FIX: Removed filter to handle API variations, filter manually
             const response = await notion.search({
                 query: "", 
                 start_cursor: cursor,
                 page_size: 100
             });
-
             if (response.results) {
-                // Filter for data_source OR database
                 const databases = response.results.filter(item => item.object === 'database' || item.object === 'data_source');
-                
                 databases.forEach(item => {
                     allDBs.push({
                         id: item.id,
@@ -563,13 +572,10 @@ const listAllNotionDatabases = async () => {
                     });
                 });
             }
-
             cursor = response.has_more ? response.next_cursor : undefined;
         } while (cursor);
-
         console.log(`[Notion] Found ${allDBs.length} databases:`, allDBs);
         return allDBs;
-
     } catch (error) {
         console.error("[Notion] Failed to list databases:", error.message);
         throw error;
@@ -579,42 +585,28 @@ const listAllNotionDatabases = async () => {
 const fetchAllRowsInDataSource = async (data_source_id) => {
   const allPages = [];
   let cursor;
-
   do {
     const response = await notion.dataSources.query({
       data_source_id,
       start_cursor: cursor,
       page_size: 100
     });
-
     allPages.push(...response.results);
     cursor = response.has_more ? response.next_cursor : undefined;
   } while (cursor);
-
   return allPages;
 };
 
-// Test route: fetch all pages in a Notion database by ID
 app.get('/api/v1/notion-data-source-rows', async (req, res) => {
   try {
     const { db_id } = req.query;
-    if (!db_id) {
-      return res.status(400).send({ message: "Missing query param: db_id" });
-    }
-
+    if (!db_id) return res.status(400).send({ message: "Missing query param: db_id" });
     const pages = await fetchAllRowsInDataSource(db_id);
-
-    res.status(200).send({
-      count: pages.length,
-      pages: pages.map(simplifyAnyPage)
-    });
+    res.status(200).send({ count: pages.length, pages: pages.map(simplifyAnyPage) });
   } catch (error) {
-    console.error("Error fetching rows:", error.message);
     res.status(500).send({ error: error.message });
   }
 });
-
-
 
 app.get('/api/v1/list-notion-databases', async (req, res) => {
     try {
@@ -626,9 +618,8 @@ app.get('/api/v1/list-notion-databases', async (req, res) => {
 });
 
 
-// --- MCP SERVER API ENDPOINTS ---
+// --- UPDATED: SLACK INTERACTION HANDLER (Buttons + Modal + Chat Loop) ---
 
-// --- UPDATED: SLACK INTERACTION HANDLER (Buttons + Modal Loop) ---
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
         const payload = JSON.parse(req.body.payload);
@@ -644,7 +635,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                 const taskData = JSON.parse(action.value);
                 const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
-                // Helper: Build the Properties Object
+                // Construct Notion Properties
                 const notionProperties = {
                     "Tasks": { title: [{ text: { content: taskData.title } }] },
                     "Status": { status: { name: taskData.status || "To do" } },
@@ -656,28 +647,20 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                     "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
                 };
 
-                // Conditional Dates
                 if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
                 if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
 
-                // --- EXECUTE CREATE OR UPDATE ---
-
                 if (taskData.action === 'CREATE') {
-                    console.log(`[Slack Action] Creating new task in Source ID: ${sourceId}`);
-                    
-                    // --- FIX APPLIED HERE ---
+                    console.log(`[Slack] Creating task: ${taskData.title}`);
+                    // FIX: Using correct parent structure for 2025 API
                     await notion.pages.create({
-                        parent: { 
-                            type: "data_source_id", 
-                            data_source_id: sourceId 
-                        },
+                        parent: { type: "data_source_id", data_source_id: sourceId },
                         properties: notionProperties
                     });
-                    // ------------------------
                     
-                    res.status(200).json({
+                    return res.status(200).json({
                         replace_original: "true",
-                        text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
+                        text: `✅ *Created:* ${taskData.title} \n_Focus: ${taskData.focus_this_week}_`
                     });
 
                 } else if (taskData.action === 'UPDATE') {
@@ -706,17 +689,16 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
                          res.status(400).send("Could not determine Page ID for update.");
                     }
                 }
-
             } 
             
             // --- B. HANDLE "SKIP" ---
             else if (action.action_id === 'skip_task') {
-                 res.status(200).json({
+                return res.status(200).json({
                     replace_original: "true",
-                    text: `⏭️ *Skipped:* Task ignored.`
+                    text: `⏭️ *Skipped*`
                 });
-            } 
-            
+            }
+
             // --- C. HANDLE "FEEDBACK" (Open Modal) ---
             else if (action.action_id === 'feedback_task') {
                 let taskData = {};
@@ -748,7 +730,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         }
 
         // ---------------------------------------------------------
-        // CASE 2: MODAL SUBMISSION (Loop Core)
+        // CASE 2: MODAL SUBMISSION (Refine & Post NEW Card)
         // ---------------------------------------------------------
         if (payload.type === 'view_submission' && payload.view.callback_id === 'feedback_modal_submit') {
             
@@ -758,50 +740,58 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
             const session = feedbackSessions.get(sessionId);
 
             if (!session) {
-                // Failsafe if session lost
                 return res.status(200).json({ response_action: "clear" }); 
             }
 
-            // 2. Extract Edits
-            const values = payload.view.state.values;
-            const newTitle = values.title_block.title.value;
-            const newNotes = values.notes_block.notes.value;
+            // 2. Extract ALL Values
+            const v = payload.view.state.values;
+            const getVal = (block, action) => v[block]?.[action]?.value;
+            const getSel = (block, action) => v[block]?.[action]?.selected_option?.value; // For static selects
+            const getTxt = (block, action) => v[block]?.[action]?.selected_option?.text?.text; // For text-based selects
+            const getDate = (block, action) => v[block]?.[action]?.selected_date;
 
-            // 3. Update Data (FIX 1: No duplicate keys)
+            // 3. Update Task Data
             const updatedTask = {
-                ...session.task,
-                title: newTitle,
-                notes: newNotes + "\n\n(Refined via Feedback Loop)"
+                ...session.task, // preserve IDs
+                title: getVal('title_block', 'title'),
+                notes: getVal('notes_block', 'notes') + "\n(Refined by User)",
+                owner: getVal('owner_block', 'owner'),
+                project: getVal('project_block', 'project'),
+                linked_jtbd: getVal('jtbd_block', 'jtbd'),
+                
+                // Selects return the value field
+                priority: getTxt('priority_block', 'priority'), 
+                status: getTxt('status_block', 'status'),
+                focus_this_week: getTxt('focus_block', 'focus'), // Yes/No
+                
+                // Dates
+                start_date: getDate('start_date_block', 'start_date'),
+                due_date: getDate('due_date_block', 'due_date')
             };
 
-            // 4. Update Session & AI Hook (FIX 3: Hook for future AI)
-            session.aiSuggestion = { 
-                ...updatedTask, 
-                suggestion_reason: "User refined via modal" 
-            };
-            session.task = updatedTask;
+            // 4. Update Session
             session.iteration += 1;
-            
+            session.task = updatedTask;
             feedbackSessions.set(sessionId, session);
 
-            // 5. Re-open Modal (FIX 2: Correct Loop Strategy)
-            // We use 'response_action: clear' to close current, and async open new one.
-            // This is the cleanest way to "refresh" the view in an infinite loop.
-            await openFeedbackModal(
-                payload.trigger_id, // Trigger ID from submission allows opening new views
-                { ...updatedTask, iteration: session.iteration },
-                sessionId
+            // 5. POST NEW MESSAGE TO SLACK (The Loop)
+            const targetDbId = updatedTask.targetDbId || NOTION_TASK_DB_ID;
+            
+            await sendTaskListToSlack(
+                [updatedTask], 
+                `Refined Proposal (v${session.iteration})`, 
+                targetDbId
             );
             
+            // 6. Close Modal
             return res.status(200).json({ response_action: "clear" });
         }
 
     } catch (error) {
         console.error("Slack Interaction Error:", error.message);
-        res.status(500).send("Error processing interaction");
+        res.status(500).send("Error");
     }
 });
-
 
 app.post('/api/v1/slack-approved-tasks', async (req, res) => {
     // This was your old endpoint for bulk approval, leaving it as requested.
