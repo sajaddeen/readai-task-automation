@@ -1,11 +1,13 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+// FIX: We no longer need the OpenAI package, only the mongoose instance and connection
 const { connectDB } = require('@read-ai/shared-config');
 const mongoose = require('mongoose');
 const { Client } = require('@notionhq/client');
 const { WebClient } = require('@slack/web-api');
 const crypto = require('crypto');
 const axios = require('axios');
+// Ensure these utility files exist in your project structure
 const { simplifyAnyPage } = require('../utilities/notionHelper');
 const { findBestDatabaseMatch } = require('../utilities/dbFinder');
 
@@ -13,7 +15,7 @@ const notion = new Client({ auth: process.env.NOTION_API_KEY });
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 const SLACK_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL;
-const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID;
+const NOTION_TASK_DB_ID = process.env.NOTION_TASK_DB_ID; // Fallback ID
 const PORT = process.env.MCP_PORT || 3001;
 const app = express();
 
@@ -23,7 +25,74 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true })); 
 
 
-// --- NEW: SLACK MESSAGING HELPER WITH BUTTONS ---
+// --- FEEDBACK LOOP SESSION STORE (In-Memory) ---
+// Stores task data while the user is editing it in the modal loop
+const feedbackSessions = new Map();
+/*
+sessionId => {
+  task,
+  iteration,
+  aiSuggestion
+}
+*/
+
+// --- NEW: FEEDBACK MODAL BUILDER (Helper Function) ---
+const openFeedbackModal = async (triggerId, task, sessionId) => {
+    await slackClient.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "feedback_modal_submit",
+        private_metadata: JSON.stringify({ sessionId }), // Pass ID to recover state
+        title: { type: "plain_text", text: "Refine Task" },
+        submit: { type: "plain_text", text: "Refine & Loop" }, // Infinite loop button
+        close: { type: "plain_text", text: "Cancel" },
+        blocks: [
+          {
+            type: "context",
+            elements: [
+              {
+                type: "mrkdwn",
+                text: `🧠 *Iteration ${task.iteration || 1}* — Review details below.`
+              }
+            ]
+          },
+          {
+            type: "input",
+            block_id: "title_block",
+            label: { type: "plain_text", text: "Title" },
+            element: {
+              type: "plain_text_input",
+              action_id: "title",
+              initial_value: task.title
+            }
+          },
+          {
+            type: "input",
+            block_id: "notes_block",
+            label: { type: "plain_text", text: "Notes / Context" },
+            element: {
+              type: "plain_text_input",
+              action_id: "notes",
+              multiline: true,
+              initial_value: task.notes
+            }
+          },
+          // Optional: Context display for hidden fields
+          {
+            type: "context",
+            elements: [
+              { type: "mrkdwn", text: `*Dates:* ${task.start_date || "—"} to ${task.due_date || "—"}` },
+              { type: "mrkdwn", text: `*Owner:* ${task.owner || "Unassigned"}` }
+            ]
+          }
+        ]
+      }
+    });
+};
+
+
+// --- SLACK MESSAGING HELPER WITH BUTTONS ---
 
 const sendTaskListToSlack = async (taskList, meetingTitle, targetDbId) => {
     if (!SLACK_CHANNEL || !process.env.SLACK_BOT_TOKEN) {
@@ -129,6 +198,7 @@ ${task.notes}`;
                     type: "button",
                     text: { type: "plain_text", text: "💬 Feedback" },
                     action_id: "feedback_task",
+                    // CRITICAL UPDATE: Pass full payload so modal can pre-fill
                     value: buttonPayload
                 }
             ]
@@ -474,18 +544,18 @@ const listAllNotionDatabases = async () => {
         let cursor = undefined;
 
         do {
+            // FIX: Removed filter to handle API variations, filter manually
             const response = await notion.search({
-                query: "", // empty to list everything
-                filter: {
-                    property: "object",
-                    value: "data_source"
-                },
+                query: "", 
                 start_cursor: cursor,
                 page_size: 100
             });
 
             if (response.results) {
-                response.results.forEach(item => {
+                // Filter for data_source OR database
+                const databases = response.results.filter(item => item.object === 'database' || item.object === 'data_source');
+                
+                databases.forEach(item => {
                     allDBs.push({
                         id: item.id,
                         title: item.title?.map(t => t.plain_text).join("") || "(No title)",
@@ -558,95 +628,172 @@ app.get('/api/v1/list-notion-databases', async (req, res) => {
 
 // --- MCP SERVER API ENDPOINTS ---
 
-// --- REPLACED: NEW INTERACTIVE SLACK ENDPOINT (FIXED PARENT TYPE) ---
+// --- UPDATED: SLACK INTERACTION HANDLER (Buttons + Modal Loop) ---
 app.post('/api/v1/slack-interaction', async (req, res) => {
     try {
         const payload = JSON.parse(req.body.payload);
-        const action = payload.actions[0];
-        
-        // IMPORTANT: Slack expects a 200 OK immediately.
-        
-        if (action.action_id === 'accept_task') {
-            const taskData = JSON.parse(action.value);
-            // We treat the "DB ID" as a "Data Source ID" now
-            const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
-            // Helper: Build the Properties Object
-            const notionProperties = {
-                "Tasks": { title: [{ text: { content: taskData.title } }] },
-                "Status": { status: { name: taskData.status || "To do" } },
-                "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
-                "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
-                "Priority Level": { select: { name: taskData.priority || "Medium" } },
-                "Source": { select: { name: "Virtual Meeting" } },
-                "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
-                "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
-            };
+        // ---------------------------------------------------------
+        // CASE 1: BUTTON CLICKS (Block Actions)
+        // ---------------------------------------------------------
+        if (payload.type === 'block_actions') {
+            const action = payload.actions[0];
+            
+            // --- A. HANDLE "ACCEPT" (Direct Create/Update) ---
+            if (action.action_id === 'accept_task') {
+                const taskData = JSON.parse(action.value);
+                const sourceId = taskData.targetDbId || NOTION_TASK_DB_ID;
 
-            // Conditional Dates
-            if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
-            if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
+                // Helper: Build the Properties Object
+                const notionProperties = {
+                    "Tasks": { title: [{ text: { content: taskData.title } }] },
+                    "Status": { status: { name: taskData.status || "To do" } },
+                    "Jobs": { rich_text: [{ text: { content: taskData.linked_jtbd || "" } }] },
+                    "Owner": { rich_text: [{ text: { content: taskData.owner || "" } }] },
+                    "Priority Level": { select: { name: taskData.priority || "Medium" } },
+                    "Source": { select: { name: "Virtual Meeting" } },
+                    "Notes": { rich_text: [{ text: { content: taskData.notes || "" } }] },
+                    "Focus This Week": { checkbox: taskData.focus_this_week === "Yes" }
+                };
 
-            // --- EXECUTE CREATE OR UPDATE ---
+                // Conditional Dates
+                if (taskData.start_date) notionProperties["Start Date"] = { date: { start: taskData.start_date } };
+                if (taskData.due_date) notionProperties["Due Date"] = { date: { start: taskData.due_date } };
 
-            if (taskData.action === 'CREATE') {
-                console.log(`[Slack Action] Creating new task in Source ID: ${sourceId}`);
-                
-                // --- FIX APPLIED HERE ---
-                await notion.pages.create({
-                    parent: { 
-                        type: "data_source_id", 
-                        data_source_id: sourceId 
-                    },
-                    properties: notionProperties
-                });
-                // ------------------------
-                
-                res.status(200).json({
-                    replace_original: "true",
-                    text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
-                });
+                // --- EXECUTE CREATE OR UPDATE ---
 
-            } else if (taskData.action === 'UPDATE') {
-                let pageId = taskData.id; 
-                if (!pageId && taskData.notion_url) {
-                    const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
-                    if(matches) pageId = matches[0];
-                }
-
-                if (pageId) {
-                    console.log(`[Slack Action] Updating Page ID: ${pageId}`);
-                    notionProperties["Notes"] = { 
-                        rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
-                    };
-
-                    await notion.pages.update({
-                        page_id: pageId,
+                if (taskData.action === 'CREATE') {
+                    console.log(`[Slack Action] Creating new task in Source ID: ${sourceId}`);
+                    
+                    // --- FIX APPLIED HERE ---
+                    await notion.pages.create({
+                        parent: { 
+                            type: "data_source_id", 
+                            data_source_id: sourceId 
+                        },
                         properties: notionProperties
                     });
-
+                    // ------------------------
+                    
                     res.status(200).json({
                         replace_original: "true",
-                        text: `✅ *Updated:* ${taskData.title} in Notion.`
+                        text: `✅ *Created:* ${taskData.title} in Notion. \n_Focus: ${taskData.focus_this_week}_`
                     });
-                } else {
-                     res.status(400).send("Could not determine Page ID for update.");
+
+                } else if (taskData.action === 'UPDATE') {
+                    let pageId = taskData.id; 
+                    if (!pageId && taskData.notion_url) {
+                        const matches = taskData.notion_url.match(/([a-f0-9]{32})/);
+                        if(matches) pageId = matches[0];
+                    }
+
+                    if (pageId) {
+                        console.log(`[Slack Action] Updating Page ID: ${pageId}`);
+                        notionProperties["Notes"] = { 
+                            rich_text: [{ text: { content: (taskData.notes || "") + "\n[Updated via Slack]" } }] 
+                        };
+
+                        await notion.pages.update({
+                            page_id: pageId,
+                            properties: notionProperties
+                        });
+
+                        res.status(200).json({
+                            replace_original: "true",
+                            text: `✅ *Updated:* ${taskData.title} in Notion.`
+                        });
+                    } else {
+                         res.status(400).send("Could not determine Page ID for update.");
+                    }
                 }
+
+            } 
+            
+            // --- B. HANDLE "SKIP" ---
+            else if (action.action_id === 'skip_task') {
+                 res.status(200).json({
+                    replace_original: "true",
+                    text: `⏭️ *Skipped:* Task ignored.`
+                });
+            } 
+            
+            // --- C. HANDLE "FEEDBACK" (Open Modal) ---
+            else if (action.action_id === 'feedback_task') {
+                let taskData = {};
+                try {
+                     taskData = JSON.parse(action.value);
+                } catch(e) {
+                    console.log("Feedback button missing payload.", e);
+                }
+
+                const sessionId = crypto.randomUUID();
+
+                // Store in memory
+                feedbackSessions.set(sessionId, {
+                    task: taskData,
+                    iteration: 1,
+                    aiSuggestion: taskData
+                });
+
+                // Open the modal
+                await openFeedbackModal(
+                    payload.trigger_id,
+                    { ...taskData, iteration: 1 },
+                    sessionId
+                );
+
+                // Acknowledge click immediately
+                return res.status(200).send();
+            }
+        }
+
+        // ---------------------------------------------------------
+        // CASE 2: MODAL SUBMISSION (Loop Core)
+        // ---------------------------------------------------------
+        if (payload.type === 'view_submission' && payload.view.callback_id === 'feedback_modal_submit') {
+            
+            // 1. Recover Session
+            const metadata = JSON.parse(payload.view.private_metadata);
+            const sessionId = metadata.sessionId;
+            const session = feedbackSessions.get(sessionId);
+
+            if (!session) {
+                // Failsafe if session lost
+                return res.status(200).json({ response_action: "clear" }); 
             }
 
-        } else if (action.action_id === 'skip_task') {
-             res.status(200).json({
-                replace_original: "true",
-                text: `⏭️ *Skipped:* Task ignored.`
-            });
+            // 2. Extract Edits
+            const values = payload.view.state.values;
+            const newTitle = values.title_block.title.value;
+            const newNotes = values.notes_block.notes.value;
 
-        } else if (action.action_id === 'feedback_task') {
-            res.status(200).json({
-                replace_original: "false",
-                text: `📝 Feedback noted. (Modal logic to be implemented)`
-            });
-        } else {
-            res.status(200).send();
+            // 3. Update Data (FIX 1: No duplicate keys)
+            const updatedTask = {
+                ...session.task,
+                title: newTitle,
+                notes: newNotes + "\n\n(Refined via Feedback Loop)"
+            };
+
+            // 4. Update Session & AI Hook (FIX 3: Hook for future AI)
+            session.aiSuggestion = { 
+                ...updatedTask, 
+                suggestion_reason: "User refined via modal" 
+            };
+            session.task = updatedTask;
+            session.iteration += 1;
+            
+            feedbackSessions.set(sessionId, session);
+
+            // 5. Re-open Modal (FIX 2: Correct Loop Strategy)
+            // We use 'response_action: clear' to close current, and async open new one.
+            // This is the cleanest way to "refresh" the view in an infinite loop.
+            await openFeedbackModal(
+                payload.trigger_id, // Trigger ID from submission allows opening new views
+                { ...updatedTask, iteration: session.iteration },
+                sessionId
+            );
+            
+            return res.status(200).json({ response_action: "clear" });
         }
 
     } catch (error) {
@@ -654,6 +801,7 @@ app.post('/api/v1/slack-interaction', async (req, res) => {
         res.status(500).send("Error processing interaction");
     }
 });
+
 
 app.post('/api/v1/slack-approved-tasks', async (req, res) => {
     // This was your old endpoint for bulk approval, leaving it as requested.
