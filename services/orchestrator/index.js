@@ -7,48 +7,47 @@ const crypto = require('crypto');
 const logger = require('../utilities/logger'); 
 
 const PORT = process.env.ORCHESTRATOR_PORT || 3000;
-const MCP_SERVER_URL = process.env.MCP_SERVER_URL; // e.g., http://localhost:3001
+const MCP_SERVER_URL = process.env.MCP_SERVER_URL;
 
 if (!MCP_SERVER_URL) throw new Error("MCP_SERVER_URL is missing.");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Increase limit because Read AI payloads are large
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// --- 1. SHARED PIPELINE (Calls your MCP Server) ---
-const runPipeline = async (data, res) => {
+// --- 1. PIPELINE RUNNER (Modified for Background Processing) ---
+// Note: We removed 'res' from arguments because we don't send the response here anymore
+const runPipelineBackground = async (data) => {
     const { traceId, transcript, source, source_id, meeting_title, participants } = data;
     try {
-        logger.info(`[Pipeline] Forwarding to MCP: "${meeting_title}"`, { traceId });
+        logger.info(`[Pipeline] Background processing started: "${meeting_title}"`, { traceId });
 
-        // This calls your EXISTING Slack Bot logic
+        // Forward to MCP (The heavy lifting)
         await axios.post(`${MCP_SERVER_URL}/api/v1/process-transcript`, {
             trace_id: traceId,
-            transcript: transcript, // Clean text
+            transcript: transcript,
             source: source,
             source_id: source_id,
             meeting_title: meeting_title,
             participants: participants
         });
 
-        res.status(200).send({ message: 'Pipeline started.' });
+        logger.info(`[Pipeline] ✅ Successfully handed off to MCP`, { traceId });
+
     } catch (error) {
-        logger.error("Pipeline Failed", error.message, { traceId });
-        res.status(500).send({ error: error.message });
+        // Log detailed error info to fix the "undefined" issue
+        const errMsg = error.response?.data?.error || error.message;
+        logger.error(`[Pipeline] ❌ Failed: ${errMsg}`, { traceId });
     }
 };
 
-// --- 2. HELPER: CONVERT READ AI JSON TO TEXT ---
+// --- 2. HELPER: PARSE READ AI JSON ---
 const parseReadAIPayload = (body) => {
-    // Check if it's actually Read AI data
     if (!body.transcript || !body.transcript.speaker_blocks) {
-        throw new Error("Invalid Read AI Payload");
+        throw new Error("Invalid Read AI Payload: Missing speaker_blocks");
     }
-
-    // Convert structured blocks to simple "Speaker: Text" format
     const textTranscript = body.transcript.speaker_blocks
         .map(block => `${block.speaker?.name || "Unknown"}: ${block.words}`)
         .join("\n");
@@ -61,35 +60,44 @@ const parseReadAIPayload = (body) => {
     };
 };
 
-// --- 3. THE WEBHOOK ENDPOINT ---
+// --- 3. WEBHOOK ENDPOINT (Async/Non-Blocking) ---
 app.post('/api/v1/webhook', async (req, res) => {
     const traceId = crypto.randomUUID();
     
-    // A. DETECT READ AI (Trigger: "meeting_end")
+    // A. DETECT READ AI
     if (req.body.trigger === "meeting_end") {
         logger.info("⚡ Detected Read AI Webhook", { traceId });
+        
+        // Step 1: Reply to Read AI IMMEDIATELY
+        // This stops them from timing out and disconnecting
+        res.status(200).send({ status: "received" });
+
+        // Step 2: Process in Background
         try {
             const data = parseReadAIPayload(req.body);
-            await runPipeline({ ...data, traceId, source: "read_ai" }, res);
+            // Run without 'await' blocking the response
+            runPipelineBackground({ ...data, traceId, source: "read_ai" });
         } catch (err) {
             logger.error("Read AI Parse Error", err.message, { traceId });
-            res.status(400).send({ error: "Invalid Read AI Data" });
         }
         return;
     }
 
-    // B. STANDARD WEBHOOK (Fallback)
-    logger.info("Standard Webhook received", { traceId });
+    // B. STANDARD WEBHOOK
     if (!req.body.transcript) return res.status(400).send({ error: "Missing transcript" });
+    
+    // Reply immediately
+    res.status(200).send({ status: "received", trace_id: traceId });
 
-    await runPipeline({
+    // Process in background
+    runPipelineBackground({
         traceId,
         transcript: req.body.transcript,
         source: "webhook",
         source_id: req.body.email || "anonymous",
         meeting_title: req.body.meeting_title || "Webhook Upload",
         participants: []
-    }, res);
+    });
 });
 
 // --- 4. FILE UPLOAD ENDPOINT (Legacy) ---
@@ -97,6 +105,8 @@ app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res)
     const traceId = crypto.randomUUID();
     if (!req.file) return res.status(400).send({ message: "No file provided" });
 
+    // For file uploads (User Interface), users usually WANT to wait for confirmation.
+    // So we keep this synchronous (awaiting the result), unlike the webhook.
     try {
         let rawText = "";
         if (req.file.originalname.endsWith('.docx')) {
@@ -105,15 +115,22 @@ app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res)
         } else {
             rawText = req.file.buffer.toString('utf8');
         }
+        
+        // Notify user we are starting
+        logger.info(`[Upload] Processing file: ${req.file.originalname}`, { traceId });
 
-        await runPipeline({
+        // Run Logic
+        await runPipelineBackground({
             traceId,
             transcript: rawText,
             source: "file-upload",
             source_id: req.body.email || "user_upload",
             meeting_title: req.body.meeting_title || req.file.originalname,
             participants: []
-        }, res);
+        });
+
+        // Reply Success
+        res.status(200).send({ message: "File processed successfully", trace_id: traceId });
 
     } catch (err) {
         logger.error("File Upload Error", err.message, { traceId });
