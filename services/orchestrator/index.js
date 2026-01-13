@@ -1,134 +1,130 @@
 const express = require('express');
-const bodyParser = require('body-parser');
 const axios = require('axios');
 const { connectDB } = require('@read-ai/shared-config');
 const multer = require('multer');
 const mammoth = require('mammoth');
 const crypto = require('crypto');
-
-const logger = require('../utilities/logger');
+const logger = require('./utilities/logger'); 
 
 const PORT = process.env.ORCHESTRATOR_PORT || 3000;
-const MCP_SERVER_URL = process.env.MCP_SERVER_URL;
+const MCP_SERVER_URL = process.env.MCP_SERVER_URL; // e.g., http://localhost:3001
 
-if (!MCP_SERVER_URL) {
-  throw new Error("MCP_SERVER_URL is not defined in Environment Variables");
-}
+if (!MCP_SERVER_URL) throw new Error("MCP_SERVER_URL is missing.");
 
 const app = express();
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
+// Increase limit because Read AI payloads are large
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// --- 1. SHARED PIPELINE (Calls your MCP Server) ---
+const runPipeline = async (data, res) => {
+    const { traceId, transcript, source, source_id, meeting_title, participants } = data;
+    try {
+        logger.info(`[Pipeline] Forwarding to MCP: "${meeting_title}"`, { traceId });
 
-// --- DOCUMENT PROCESSING FUNCTION ---
-const extractTextFromFile = async (file, traceId) => {
-    const fileExtension = file.originalname.split('.').pop().toLowerCase();
-    const buffer = file.buffer;
+        // This calls your EXISTING Slack Bot logic
+        await axios.post(`${MCP_SERVER_URL}/api/v1/process-transcript`, {
+            trace_id: traceId,
+            transcript: transcript, // Clean text
+            source: source,
+            source_id: source_id,
+            meeting_title: meeting_title,
+            participants: participants
+        });
 
-    logger.info(`[File Processor] Detected file type: ${fileExtension}`, { traceId });
-
-    switch (fileExtension) {
-        case 'txt':
-            return buffer.toString('utf8');
-        case 'docx':
-            try {
-                const result = await mammoth.extractRawText({ buffer: buffer });
-                return result.value;
-            } catch (e) {
-                throw new Error(`DOCX Parsing Failed: ${e.message}`);
-            }
-        case 'pdf': 
-            throw new Error("PDF support coming soon. Please use .txt or .docx");
-        default:
-            throw new Error(`Unsupported file type: .${fileExtension}`);
+        res.status(200).send({ message: 'Pipeline started.' });
+    } catch (error) {
+        logger.error("Pipeline Failed", error.message, { traceId });
+        res.status(500).send({ error: error.message });
     }
 };
 
-// --- API ENDPOINT ---
-app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res) => {
-    
-    // 1. Generate Trace ID (The birth of the request!)
+// --- 2. HELPER: CONVERT READ AI JSON TO TEXT ---
+const parseReadAIPayload = (body) => {
+    // Check if it's actually Read AI data
+    if (!body.transcript || !body.transcript.speaker_blocks) {
+        throw new Error("Invalid Read AI Payload");
+    }
+
+    // Convert structured blocks to simple "Speaker: Text" format
+    const textTranscript = body.transcript.speaker_blocks
+        .map(block => `${block.speaker?.name || "Unknown"}: ${block.words}`)
+        .join("\n");
+
+    return {
+        transcript: textTranscript,
+        meeting_title: body.title || "Read AI Meeting",
+        source_id: body.owner?.email || "read_ai_webhook",
+        participants: body.participants || []
+    };
+};
+
+// --- 3. THE WEBHOOK ENDPOINT ---
+app.post('/api/v1/webhook', async (req, res) => {
     const traceId = crypto.randomUUID();
-
-    if (!req.file) {
-        logger.warn("Upload attempted without file.", { traceId });
-        return res.status(400).send({ message: "File required ('transcriptFile')." });
-    }
-
-    const source = req.body.source || 'file-upload'; 
-    const source_id = req.body.source_id || new Date().toISOString();
-    const meeting_title = req.body.meeting_title || req.file.originalname;
     
-    // Safe Parse Participants
-    let participants = [];
-    if (req.body.participants) {
-        try { participants = JSON.parse(req.body.participants); } 
-        catch (e) { logger.warn("Failed to parse participants JSON", { traceId }); }
+    // A. DETECT READ AI (Trigger: "meeting_end")
+    if (req.body.trigger === "meeting_end") {
+        logger.info("⚡ Detected Read AI Webhook", { traceId });
+        try {
+            const data = parseReadAIPayload(req.body);
+            await runPipeline({ ...data, traceId, source: "read_ai" }, res);
+        } catch (err) {
+            logger.error("Read AI Parse Error", err.message, { traceId });
+            res.status(400).send({ error: "Invalid Read AI Data" });
+        }
+        return;
     }
+
+    // B. STANDARD WEBHOOK (Fallback)
+    logger.info("Standard Webhook received", { traceId });
+    if (!req.body.transcript) return res.status(400).send({ error: "Missing transcript" });
+
+    await runPipeline({
+        traceId,
+        transcript: req.body.transcript,
+        source: "webhook",
+        source_id: req.body.email || "anonymous",
+        meeting_title: req.body.meeting_title || "Webhook Upload",
+        participants: []
+    }, res);
+});
+
+// --- 4. FILE UPLOAD ENDPOINT (Legacy) ---
+app.post('/api/v1/transcript', upload.single('transcriptFile'), async (req, res) => {
+    const traceId = crypto.randomUUID();
+    if (!req.file) return res.status(400).send({ message: "No file provided" });
 
     try {
-        // 2. Extract Text
-        const rawTranscript = await extractTextFromFile(req.file, traceId);
-        
-        if (!rawTranscript || rawTranscript.trim().length < 50) {
-            throw new Error("Extracted text is empty or too short (<50 chars).");
+        let rawText = "";
+        if (req.file.originalname.endsWith('.docx')) {
+            const result = await mammoth.extractRawText({ buffer: req.file.buffer });
+            rawText = result.value;
+        } else {
+            rawText = req.file.buffer.toString('utf8');
         }
 
-        logger.info(`Pipeline started for: "${meeting_title}" (${rawTranscript.length} chars)`, { traceId });
+        await runPipeline({
+            traceId,
+            transcript: rawText,
+            source: "file-upload",
+            source_id: req.body.email || "user_upload",
+            meeting_title: req.body.meeting_title || req.file.originalname,
+            participants: []
+        }, res);
 
-        // 3. Send to MCP Server (OPTIMIZED)
-        // We only call /process-transcript. It handles normalization internally.
-        // Critically: We pass 'trace_id' so logs connect across services!
-        const response = await axios.post(
-            `${MCP_SERVER_URL}/api/v1/process-transcript`, 
-            {
-                trace_id: traceId, 
-                transcript: rawTranscript,
-                source,
-                source_id,
-                meeting_title,
-                participants,
-                raw_transcript: rawTranscript
-            },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 300000 // 5 minutes
-            }
-        );
-
-        logger.info("Pipeline initiated successfully.", { traceId });
-
-        // 4. Respond to Client
-        res.status(202).send({ 
-            message: 'Transcript accepted and processing pipeline initiated.',
-            trace_id: traceId,
-            status: 'processing'
-        });
-
-    } catch (error) {
-        // If axios error, extract the real message
-        const status = error.response?.status || 500;
-        const msg = error.response?.data?.error || error.message;
-        
-        // Logger sends this to Slack automatically!
-        await logger.error("Orchestrator Pipeline Failed", error, { traceId });
-        
-        res.status(status).send({ 
-            message: `Pipeline failed: ${msg}`,
-            trace_id: traceId 
-        });
+    } catch (err) {
+        logger.error("File Upload Error", err.message, { traceId });
+        res.status(500).send({ error: err.message });
     }
 });
 
-// Start Server
 const startServer = async () => {
     await connectDB();
     app.listen(PORT, "0.0.0.0", () => {
-        // Use console.log for startup as logger might rely on connection
-        console.log(`🚀 Orchestrator Service running on port ${PORT}`);
+        console.log(`🚀 Orchestrator running on port ${PORT}`);
     });
 };
 
