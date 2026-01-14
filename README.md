@@ -2,7 +2,6 @@
 
 ---
 
-```markdown
 # ReadAI Task Automation
 
 **Automated Task Extraction and Management from Meeting Transcripts**
@@ -32,6 +31,7 @@ Instead of blindly dumping AI-generated tasks into a database, it uses a **Model
 
 The system follows a linear pipeline: **Input** → **Processing** → **Validation** → **Storage**.
 
+```mermaid
 flowchart LR
     %% --- INPUTS ---
     subgraph Inputs ["📂 INPUT SOURCES"]
@@ -77,6 +77,8 @@ flowchart LR
     %% STYLE CLASSES
     classDef darkNode fill:#333,stroke:#fff,stroke-width:2px,color:#fff;
     class ReadAI,Manual,Orch,MCP,Queue,SlackOut,User,Notion darkNode;
+```
+
 
 ---
 
