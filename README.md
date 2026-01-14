@@ -32,7 +32,6 @@ Instead of blindly dumping AI-generated tasks into a database, it uses a **Model
 
 The system follows a linear pipeline: **Input** → **Processing** → **Validation** → **Storage**.
 
-```mermaid
 flowchart LR
     %% --- INPUTS ---
     subgraph Inputs ["📂 INPUT SOURCES"]
@@ -63,6 +62,7 @@ flowchart LR
 
     %% CONNECTIONS
     ReadAI ==>|"1. JSON"| Orch
+    Manual ==>|"1. Raw File"| Orch
     Orch <==>|"2. Normalized Text"| MCP
     MCP <==>|"3. Context Check"| Notion
     
@@ -77,8 +77,6 @@ flowchart LR
     %% STYLE CLASSES
     classDef darkNode fill:#333,stroke:#fff,stroke-width:2px,color:#fff;
     class ReadAI,Manual,Orch,MCP,Queue,SlackOut,User,Notion darkNode;
-
-```
 
 ---
 
